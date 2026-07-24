@@ -1,0 +1,8 @@
+node_modules/
+.next/
+out/
+dist/
+release/
+*.local
+*.log
+cachette-dev/

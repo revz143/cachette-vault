@@ -1,0 +1,77 @@
+{
+  "name": "cachette-vault",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Secure local desktop vault starter built with Electron, Next.js, React, and SQLite.",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"next dev -p 3000\" \"tsup src/electron/main.ts src/electron/preload.ts --format cjs --platform node --out-dir dist/electron --external electron --external better-sqlite3 --external keytar --watch\" \"wait-on dist/electron/main.js http://localhost:3000 && cross-env ELECTRON_RENDERER_URL=http://localhost:3000 electron .\"",
+    "build": "next build && tsup src/electron/main.ts src/electron/preload.ts --format cjs --platform node --out-dir dist/electron --external electron --external better-sqlite3 --external keytar",
+    "dist": "npm run build && electron-builder --win nsis",
+    "dist:dir": "npm run build && electron-builder --win dir",
+    "start": "electron .",
+    "lint": "eslint . --max-warnings=0",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^9.0.1",
+    "remark-gfm": "^4.0.0",
+    "zod": "^3.24.1"
+  },
+  "optionalDependencies": {
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.1",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.1",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^15.1.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "app.cachette.vault",
+    "productName": "Cachette Vault",
+    "artifactName": "Cachette-Vault-Setup-${version}.${ext}",
+    "files": [
+      "dist/electron/**/*",
+      "out/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Cachette Vault"
+    }
+  }
+}

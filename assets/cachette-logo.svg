@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Cachette">
+  <defs>
+    <linearGradient id="cachetteGloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4cc72" />
+      <stop offset="1" stop-color="#d1962a" />
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="46" height="46" rx="13" fill="url(#cachetteGloss)" />
+  <circle cx="24" cy="19" r="7" fill="#231a05" />
+  <path d="M24 22 L30.5 37 Q24 40 17.5 37 Z" fill="#231a05" />
+</svg>

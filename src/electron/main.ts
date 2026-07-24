@@ -6,6 +6,7 @@ import type { ItemDraft, ItemFilters, ItemUpdate, VaultSettings, VaultStatus } f
 
 const SERVICE_NAME = "Cachette Vault";
 const SECURE_STORAGE_ACCOUNT = "vault-derived-key";
+const APP_ICON_PATH = path.join(app.getAppPath(), "assets", "icon.ico");
 
 let mainWindow: BrowserWindow | null = null;
 let vault: VaultDatabase;
@@ -70,6 +71,7 @@ async function createWindow(): Promise<void> {
     minWidth: 980,
     minHeight: 680,
     title: "Cachette Vault",
+    icon: APP_ICON_PATH,
     backgroundColor: "#0e1219",
     titleBarStyle: "hidden",
     trafficLightPosition: { x: 14, y: 13 },
@@ -220,21 +222,29 @@ function registerIpc(): void {
     clipboard.writeText(z.string().parse(text));
   });
 
-  ipcMain.handle("window:minimize", async () => {
-    mainWindow?.minimize();
+  ipcMain.handle("window:minimize", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    targetWindow?.minimize();
+    return Boolean(targetWindow);
   });
 
-  ipcMain.handle("window:toggle-maximize", async () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMaximized()) {
-      mainWindow.unmaximize();
-    } else {
-      mainWindow.maximize();
+  ipcMain.handle("window:toggle-maximize", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (!targetWindow) {
+      return false;
     }
+    if (targetWindow.isMaximized()) {
+      targetWindow.unmaximize();
+    } else {
+      targetWindow.maximize();
+    }
+    return true;
   });
 
-  ipcMain.handle("window:close", async () => {
-    mainWindow?.close();
+  ipcMain.handle("window:close", async (event) => {
+    const targetWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    targetWindow?.close();
+    return Boolean(targetWindow);
   });
 }
 

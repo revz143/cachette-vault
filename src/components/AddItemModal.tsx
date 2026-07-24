@@ -4,6 +4,7 @@ import { FileImage, FolderGit2, KeyRound, Link2, NotebookPen, Upload, X } from "
 import type { ComponentType, DragEvent, FormEvent } from "react";
 import { useMemo, useState } from "react";
 import type { CachetteApi, ItemDraft, ItemType, PickedFile } from "@/shared/types";
+import { MarkdownPreview } from "./MarkdownPreview";
 
 type QuickAddType = Exclude<ItemType, "private">;
 
@@ -29,6 +30,7 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
   const [category, setCategory] = useState(categories[0] ?? "General");
   const [tagsText, setTagsText] = useState("");
   const [body, setBody] = useState("");
+  const [noteMode, setNoteMode] = useState<"write" | "preview">("write");
   const [notes, setNotes] = useState("");
   const [url, setUrl] = useState("");
   const [repoPath, setRepoPath] = useState("");
@@ -69,7 +71,9 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
       return;
     }
 
-    if (!title.trim()) {
+    const resolvedTitle = title.trim() || (type === "repo" ? deriveRepoTitle(repoPath || remoteUrl) : "");
+
+    if (!resolvedTitle) {
       setError("Add a title before saving.");
       return;
     }
@@ -84,17 +88,16 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
         ? body
         : type === "link"
           ? notes
-          : type === "repo" && remoteUrl
-            ? `Remote: ${remoteUrl}${notes ? `\n\n${notes}` : ""}`
-            : notes;
+          : notes;
 
     const draft: ItemDraft = {
       type,
-      title: title.trim(),
+      title: resolvedTitle,
       category,
       tags,
       content,
       url: type === "link" || type === "password" ? url : undefined,
+      ...(type === "repo" ? { url: remoteUrl || undefined } : {}),
       repoPath: type === "repo" ? repoPath : undefined,
       encryptedData,
       attachmentPaths: attachments.map((file) => file.path)
@@ -194,16 +197,32 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
               )}
 
               {type === "note" && (
-                <label>
-                  <span>Note <em>Markdown supported</em></span>
-                  <textarea
-                    className="mono-input"
-                    value={body}
-                    onChange={(event) => setBody(event.target.value)}
-                    rows={6}
-                    placeholder={"# Heading\n- bullet\n**bold** and `code`"}
-                  />
-                </label>
+                <div className="markdown-field">
+                  <div className="field-label-row">
+                    <span>Note <em>Markdown supported</em></span>
+                    <div className="segmented-control">
+                      <button type="button" className={noteMode === "write" ? "is-active" : ""} onClick={() => setNoteMode("write")}>
+                        Write
+                      </button>
+                      <button type="button" className={noteMode === "preview" ? "is-active" : ""} onClick={() => setNoteMode("preview")}>
+                        Preview
+                      </button>
+                    </div>
+                  </div>
+                  {noteMode === "write" ? (
+                    <textarea
+                      className="mono-input"
+                      value={body}
+                      onChange={(event) => setBody(event.target.value)}
+                      rows={6}
+                      placeholder={"# Heading\n\n- bullet\n\n**bold** and `code`"}
+                    />
+                  ) : (
+                    <div className="markdown-preview-box">
+                      <MarkdownPreview markdown={body} />
+                    </div>
+                  )}
+                </div>
               )}
 
               {type === "link" && (
@@ -261,7 +280,7 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
                 Back
               </button>
               <div className="spacer" />
-              <button className="primary-button" disabled={saving || !title.trim()} type="submit">
+              <button className="primary-button" disabled={saving || !(title.trim() || (type === "repo" && (repoPath.trim() || remoteUrl.trim())))} type="submit">
                 {saving ? "Saving..." : "Save to vault"}
               </button>
             </div>
@@ -272,6 +291,17 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
       </form>
     </div>
   );
+}
+
+function deriveRepoTitle(value: string) {
+  const trimmed = value.trim().replace(/[\\\/]+$/, "");
+  if (!trimmed) return "";
+  try {
+    const url = new URL(trimmed);
+    return url.pathname.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? url.hostname;
+  } catch {
+    return trimmed.split(/[\\\/]/).filter(Boolean).pop() ?? trimmed;
+  }
 }
 
 function titlePlaceholder(type: QuickAddType) {

@@ -4,6 +4,7 @@ export type VaultStatus = {
   initialized: boolean;
   unlocked: boolean;
   secureStorageAvailable: boolean;
+  itemCount: number;
 };
 
 export type VaultSettings = {
@@ -95,7 +96,7 @@ export type CachetteApi = {
   openPath: (targetPath: string) => Promise<void>;
   openExternal: (url: string) => Promise<void>;
   copyText: (text: string) => Promise<void>;
-  windowMinimize: () => Promise<void>;
-  windowToggleMaximize: () => Promise<void>;
-  windowClose: () => Promise<void>;
+  windowMinimize: () => Promise<boolean>;
+  windowToggleMaximize: () => Promise<boolean>;
+  windowClose: () => Promise<boolean>;
 };

@@ -37,6 +37,7 @@
     "electron-builder": "^25.1.8",
     "eslint": "^8.57.1",
     "eslint-config-next": "^15.1.0",
+    "rcedit": "^5.0.2",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
     "wait-on": "^8.0.1"
@@ -45,15 +46,18 @@
     "appId": "app.cachette.vault",
     "productName": "Cachette Vault",
     "artifactName": "Cachette-Vault-Setup-${version}.${ext}",
+    "afterPack": "scripts/afterPack.cjs",
     "files": [
       "dist/electron/**/*",
       "out/**/*",
+      "assets/**/*",
       "package.json"
     ],
     "directories": {
       "output": "release"
     },
     "win": {
+      "icon": "assets/icon.ico",
       "signAndEditExecutable": false,
       "target": [
         {
@@ -69,6 +73,9 @@
       "perMachine": false,
       "allowElevation": false,
       "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Cachette Vault"

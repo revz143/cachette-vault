@@ -104,7 +104,8 @@ export class VaultDatabase {
     return {
       initialized: Boolean(this.getMetadata("vault:kdf")),
       unlocked: Boolean(this.key),
-      secureStorageAvailable
+      secureStorageAvailable,
+      itemCount: this.itemCount()
     };
   }
 
@@ -486,6 +487,11 @@ export class VaultDatabase {
 
   private setMetadata(key: string, value: string): void {
     this.db.prepare("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)").run(key, value);
+  }
+
+  private itemCount(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM items").get() as { count: number };
+    return row.count;
   }
 
   private requireKey(): Buffer {

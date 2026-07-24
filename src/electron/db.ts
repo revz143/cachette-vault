@@ -8,6 +8,8 @@ import type {
   AttachmentPreview,
   AttachmentRecord,
   BackupExportResult,
+  BackupImportRequest,
+  BackupImportResult,
   ItemDraft,
   ItemFilters,
   ItemUpdate,
@@ -362,13 +364,13 @@ export class VaultDatabase {
     return { filePath };
   }
 
-  importBackup(backupPath: string, backupPassword: string): void {
-    const raw = JSON.parse(fs.readFileSync(backupPath, "utf8")) as {
+  importBackup(request: BackupImportRequest): BackupImportResult {
+    const raw = JSON.parse(fs.readFileSync(request.backupPath, "utf8")) as {
       cachetteBackup: 1;
       kdf: VaultKdf;
       payload: string;
     };
-    const backupKey = deriveKey(backupPassword, raw.kdf.salt, raw.kdf.iterations);
+    const backupKey = deriveKey(request.backupPassword, raw.kdf.salt, raw.kdf.iterations);
 
     if (!verifyKey(backupKey, raw.kdf.verifier)) {
       throw new Error("Invalid backup password.");
@@ -379,34 +381,32 @@ export class VaultDatabase {
       throw new Error("Unsupported backup format.");
     }
 
-    const replaceAll = this.db.transaction(() => {
+    if (request.mode === "merge") {
+      this.mergeBackup(payload, request.sourceMasterPassword);
+    } else {
+      this.replaceBackup(payload);
+      this.key = null;
+    }
+
+    return {
+      mode: request.mode,
+      itemCount: payload.items.length,
+      status: this.status()
+    };
+  }
+
+  resetForDevelopment(): VaultStatus {
+    const clearAll = this.db.transaction(() => {
       this.db.prepare("DELETE FROM attachments").run();
       this.db.prepare("DELETE FROM items").run();
       this.db.prepare("DELETE FROM metadata").run();
-
-      const insertMeta = this.db.prepare("INSERT INTO metadata (key, value) VALUES (@key, @value)");
-      const insertItem = this.db.prepare(
-        `INSERT INTO items (id, type, title, content, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
-      );
-      const insertAttachment = this.db.prepare(
-        `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
-         VALUES (@id, @item_id, @file_path, @kind, @original_name, @created_at)`
-      );
-
-      for (const row of payload.metadata) insertMeta.run(row);
-      for (const row of payload.items) insertItem.run(row);
-      for (const row of payload.attachments) insertAttachment.run(row);
     });
 
-    replaceAll();
-
-    for (const file of payload.files) {
-      fs.mkdirSync(path.dirname(file.filePath), { recursive: true });
-      fs.writeFileSync(file.filePath, Buffer.from(file.data, "base64"), { mode: 0o600 });
-    }
-
+    clearAll();
+    fs.rmSync(this.attachmentRoot, { force: true, recursive: true });
+    fs.mkdirSync(this.attachmentRoot, { recursive: true });
     this.key = null;
+    return this.status();
   }
 
   private getItem(id: string): VaultItem {
@@ -470,6 +470,123 @@ export class VaultDatabase {
       originalName,
       createdAt: new Date().toISOString()
     };
+  }
+
+  private replaceBackup(payload: BackupPayload): void {
+    const replaceAll = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM attachments").run();
+      this.db.prepare("DELETE FROM items").run();
+      this.db.prepare("DELETE FROM metadata").run();
+
+      const insertMeta = this.db.prepare("INSERT INTO metadata (key, value) VALUES (@key, @value)");
+      const insertItem = this.db.prepare(
+        `INSERT INTO items (id, type, title, content, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+         VALUES (@id, @type, @title, @content, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
+      );
+      const insertAttachment = this.db.prepare(
+        `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
+         VALUES (@id, @item_id, @file_path, @kind, @original_name, @created_at)`
+      );
+
+      for (const row of payload.metadata) insertMeta.run(row);
+      for (const row of payload.items) insertItem.run(row);
+      for (const row of payload.attachments) insertAttachment.run(row);
+    });
+
+    replaceAll();
+
+    for (const file of payload.files) {
+      fs.mkdirSync(path.dirname(file.filePath), { recursive: true });
+      fs.writeFileSync(file.filePath, Buffer.from(file.data, "base64"), { mode: 0o600 });
+    }
+  }
+
+  private mergeBackup(payload: BackupPayload, sourceMasterPassword: string | undefined): void {
+    const currentKey = this.requireKey();
+    if (!sourceMasterPassword) {
+      throw new Error("Source vault master password is required for merge imports.");
+    }
+
+    const sourceKdf = this.backupVaultKdf(payload);
+    const sourceKey = deriveKey(sourceMasterPassword, sourceKdf.salt, sourceKdf.iterations);
+    if (!verifyKey(sourceKey, sourceKdf.verifier)) {
+      throw new Error("Source vault master password is incorrect.");
+    }
+
+    const now = new Date().toISOString();
+    const itemIdMap = new Map<string, string>();
+    const fileDataByPath = new Map(payload.files.map((file) => [file.filePath, file.data]));
+    const filesToWrite: Array<{ filePath: string; data: string }> = [];
+
+    const nextItems = payload.items.map((item) => {
+      const nextId = randomUUID();
+      itemIdMap.set(item.id, nextId);
+      let encryptedData = item.encrypted_data;
+
+      if (item.encrypted_data) {
+        const clear = decryptJson<Record<string, string>>(item.encrypted_data, sourceKey) ?? {};
+        encryptedData = encryptJson(clear, currentKey);
+      }
+
+      return {
+        ...item,
+        id: nextId,
+        encrypted_data: encryptedData,
+        created_at: item.created_at || now,
+        updated_at: item.updated_at || now
+      };
+    });
+
+    const nextAttachments = payload.attachments.flatMap((attachment) => {
+      const nextItemId = itemIdMap.get(attachment.item_id);
+      const data = fileDataByPath.get(attachment.file_path);
+      if (!nextItemId || !data) return [];
+
+      const nextId = randomUUID();
+      const originalName = path.basename(attachment.original_name || attachment.file_path);
+      const filePath = path.join(this.attachmentRoot, nextItemId, `${nextId}-${originalName}`);
+      filesToWrite.push({ filePath, data });
+
+      return [
+        {
+          ...attachment,
+          id: nextId,
+          item_id: nextItemId,
+          file_path: filePath,
+          original_name: originalName,
+          created_at: attachment.created_at || now
+        }
+      ];
+    });
+
+    const mergeAll = this.db.transaction(() => {
+      const insertItem = this.db.prepare(
+        `INSERT INTO items (id, type, title, content, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+         VALUES (@id, @type, @title, @content, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
+      );
+      const insertAttachment = this.db.prepare(
+        `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
+         VALUES (@id, @item_id, @file_path, @kind, @original_name, @created_at)`
+      );
+
+      for (const row of nextItems) insertItem.run(row);
+      for (const row of nextAttachments) insertAttachment.run(row);
+    });
+
+    mergeAll();
+
+    for (const file of filesToWrite) {
+      fs.mkdirSync(path.dirname(file.filePath), { recursive: true });
+      fs.writeFileSync(file.filePath, Buffer.from(file.data, "base64"), { mode: 0o600 });
+    }
+  }
+
+  private backupVaultKdf(payload: BackupPayload): VaultKdf {
+    const metadata = payload.metadata.find((row) => row.key === "vault:kdf");
+    if (!metadata) {
+      throw new Error("Backup is missing vault key metadata.");
+    }
+    return JSON.parse(metadata.value) as VaultKdf;
   }
 
   private readKdf(): VaultKdf {

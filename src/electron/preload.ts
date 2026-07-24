@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { CachetteApi, ItemDraft, ItemFilters, ItemUpdate } from "../shared/types";
+import type { BackupImportRequest, CachetteApi, ItemDraft, ItemFilters, ItemUpdate } from "../shared/types";
 
 const api: CachetteApi = {
   vaultStatus: () => ipcRenderer.invoke("vault:status"),
@@ -17,11 +17,14 @@ const api: CachetteApi = {
   attachmentPreview: (attachmentId: string) => ipcRenderer.invoke("attachments:preview", attachmentId),
   revealSecret: (itemId: string) => ipcRenderer.invoke("items:reveal-secret", itemId),
   exportBackup: (backupPassword: string) => ipcRenderer.invoke("backup:export", backupPassword),
-  importBackup: (backupPath: string, backupPassword: string) =>
-    ipcRenderer.invoke("backup:import", backupPath, backupPassword),
+  pickBackupFile: () => ipcRenderer.invoke("backup:pick"),
+  importBackup: (request: BackupImportRequest) => ipcRenderer.invoke("backup:import", request),
   settingsStatus: () => ipcRenderer.invoke("settings:status"),
   rememberWithOsStorage: () => ipcRenderer.invoke("settings:remember-os"),
   forgetOsStorage: () => ipcRenderer.invoke("settings:forget-os"),
+  setDesktopShortcut: (enabled: boolean) => ipcRenderer.invoke("settings:desktop-shortcut", enabled),
+  setRunAtStartup: (enabled: boolean) => ipcRenderer.invoke("settings:run-at-startup", enabled),
+  resetForOnboarding: () => ipcRenderer.invoke("dev:reset-onboarding"),
   changeMasterPassword: (currentPassword: string, nextPassword: string) =>
     ipcRenderer.invoke("settings:change-password", currentPassword, nextPassword),
   openPath: (targetPath: string) => ipcRenderer.invoke("shell:open-path", targetPath),

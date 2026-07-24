@@ -9,6 +9,9 @@ export type VaultStatus = {
 
 export type VaultSettings = {
   osCredentialStored: boolean;
+  desktopShortcutCreated: boolean;
+  runAtStartup: boolean;
+  developmentMode: boolean;
 };
 
 export type AttachmentRecord = {
@@ -62,6 +65,21 @@ export type BackupExportResult = {
   filePath: string;
 };
 
+export type BackupImportMode = "replace" | "merge";
+
+export type BackupImportRequest = {
+  backupPath: string;
+  backupPassword: string;
+  mode: BackupImportMode;
+  sourceMasterPassword?: string;
+};
+
+export type BackupImportResult = {
+  mode: BackupImportMode;
+  itemCount: number;
+  status: VaultStatus;
+};
+
 export type PickedFile = {
   path: string;
   name: string;
@@ -88,10 +106,14 @@ export type CachetteApi = {
   attachmentPreview: (attachmentId: string) => Promise<AttachmentPreview | null>;
   revealSecret: (itemId: string) => Promise<Record<string, string>>;
   exportBackup: (backupPassword: string) => Promise<BackupExportResult>;
-  importBackup: (backupPath: string, backupPassword: string) => Promise<void>;
+  pickBackupFile: () => Promise<PickedFile | null>;
+  importBackup: (request: BackupImportRequest) => Promise<BackupImportResult>;
   settingsStatus: () => Promise<VaultSettings>;
   rememberWithOsStorage: () => Promise<VaultSettings>;
   forgetOsStorage: () => Promise<VaultSettings>;
+  setDesktopShortcut: (enabled: boolean) => Promise<VaultSettings>;
+  setRunAtStartup: (enabled: boolean) => Promise<VaultSettings>;
+  resetForOnboarding: () => Promise<VaultStatus>;
   changeMasterPassword: (currentPassword: string, nextPassword: string) => Promise<VaultStatus>;
   openPath: (targetPath: string) => Promise<void>;
   openExternal: (url: string) => Promise<void>;

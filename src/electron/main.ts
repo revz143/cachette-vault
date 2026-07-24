@@ -1,12 +1,14 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, shell } from "electron";
+import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { VaultDatabase } from "./db";
-import type { ItemDraft, ItemFilters, ItemUpdate, VaultSettings, VaultStatus } from "../shared/types";
+import type { BackupImportRequest, ItemDraft, ItemFilters, ItemUpdate, VaultSettings, VaultStatus } from "../shared/types";
 
 const SERVICE_NAME = "Cachette Vault";
 const SECURE_STORAGE_ACCOUNT = "vault-derived-key";
 const APP_ICON_PATH = path.join(app.getAppPath(), "assets", "icon.ico");
+const SHORTCUT_NAME = "Cachette Vault.lnk";
 
 let mainWindow: BrowserWindow | null = null;
 let vault: VaultDatabase;
@@ -40,6 +42,22 @@ const filtersSchema = z
     tag: z.string().optional()
   })
   .optional();
+const backupImportSchema = z
+  .object({
+    backupPath: z.string().min(1),
+    backupPassword: z.string().min(8),
+    mode: z.enum(["replace", "merge"]),
+    sourceMasterPassword: z.string().optional()
+  })
+  .superRefine((request, context) => {
+    if (request.mode === "merge" && (!request.sourceMasterPassword || request.sourceMasterPassword.length < 8)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Source vault master password must be at least 8 characters.",
+        path: ["sourceMasterPassword"]
+      });
+    }
+  });
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
@@ -174,9 +192,32 @@ function registerIpc(): void {
     return vault.exportBackup(backupPassword);
   });
 
-  ipcMain.handle("backup:import", async (_event, backupPath: string, backupPassword: string) => {
-    requirePassword(backupPassword);
-    vault.importBackup(z.string().min(1).parse(backupPath), backupPassword);
+  ipcMain.handle("backup:pick", async () => {
+    const openDialogOptions: Electron.OpenDialogOptions = {
+      properties: ["openFile"],
+      filters: [
+        { name: "Cachette backups", extensions: ["enc"] },
+        { name: "All files", extensions: ["*"] }
+      ]
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, openDialogOptions)
+      : await dialog.showOpenDialog(openDialogOptions);
+    const backupPath = result.filePaths[0];
+
+    return backupPath ? { path: backupPath, name: path.basename(backupPath) } : null;
+  });
+
+  ipcMain.handle("backup:import", async (_event, request: BackupImportRequest) => {
+    const parsed = backupImportSchema.parse(request);
+    const result = vault.importBackup(parsed);
+    if (result.mode === "replace") {
+      await deleteStoredDerivedKeyIfAvailable();
+    }
+    return {
+      ...result,
+      status: await withSecureStorage(result.status)
+    };
   });
 
   ipcMain.handle("settings:status", async () => settingsStatus());
@@ -191,6 +232,16 @@ function registerIpc(): void {
     return settingsStatus();
   });
 
+  ipcMain.handle("settings:desktop-shortcut", async (_event, enabled: boolean) => {
+    setDesktopShortcut(z.boolean().parse(enabled));
+    return settingsStatus();
+  });
+
+  ipcMain.handle("settings:run-at-startup", async (_event, enabled: boolean) => {
+    setRunAtStartup(z.boolean().parse(enabled));
+    return settingsStatus();
+  });
+
   ipcMain.handle("settings:change-password", async (_event, currentPassword: string, nextPassword: string) => {
     requirePassword(currentPassword);
     requirePassword(nextPassword);
@@ -199,6 +250,14 @@ function registerIpc(): void {
       await storeDerivedKey(vault.currentKeyForSecureStorage());
     }
     return withSecureStorage(vault.status());
+  });
+
+  ipcMain.handle("dev:reset-onboarding", async () => {
+    if (!isDevelopmentMode()) {
+      throw new Error("Onboarding reset is only available in development mode.");
+    }
+    await deleteStoredDerivedKeyIfAvailable();
+    return withSecureStorage(vault.resetForDevelopment());
   });
 
   ipcMain.handle("shell:open-path", async (_event, targetPath: string) => {
@@ -289,14 +348,102 @@ async function deleteStoredDerivedKey(): Promise<void> {
   }
 }
 
+async function deleteStoredDerivedKeyIfAvailable(): Promise<void> {
+  const keytar = await loadKeytar();
+  if (!keytar) {
+    return;
+  }
+  if (keytar.deletePassword) {
+    await keytar.deletePassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT);
+  } else {
+    await keytar.setPassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT, "");
+  }
+}
+
 async function hasStoredDerivedKey(): Promise<boolean> {
   return Boolean(await readDerivedKey());
 }
 
 async function settingsStatus(): Promise<VaultSettings> {
   return {
-    osCredentialStored: await hasStoredDerivedKey()
+    osCredentialStored: await hasStoredDerivedKey(),
+    desktopShortcutCreated: desktopShortcutExists(),
+    runAtStartup: runAtStartupEnabled(),
+    developmentMode: isDevelopmentMode()
   };
+}
+
+function isDevelopmentMode(): boolean {
+  return !app.isPackaged || Boolean(process.env.ELECTRON_RENDERER_URL);
+}
+
+function desktopShortcutPath(): string {
+  return path.join(app.getPath("desktop"), SHORTCUT_NAME);
+}
+
+function desktopShortcutExists(): boolean {
+  return process.platform === "win32" && fs.existsSync(desktopShortcutPath());
+}
+
+function launchOptions(): { target: string; args: string; cwd: string; icon: string } {
+  return {
+    target: process.execPath,
+    args: app.isPackaged ? "" : `"${app.getAppPath()}"`,
+    cwd: app.getAppPath(),
+    icon: APP_ICON_PATH
+  };
+}
+
+function loginItemOptions(): { path: string; args: string[] } {
+  const { target, args } = launchOptions();
+  return {
+    path: target,
+    args: args ? [args] : []
+  };
+}
+
+function setDesktopShortcut(enabled: boolean): void {
+  if (process.platform !== "win32") {
+    throw new Error("Desktop shortcuts are currently supported on Windows only.");
+  }
+
+  const shortcutPath = desktopShortcutPath();
+  if (!enabled) {
+    if (desktopShortcutExists()) {
+      fs.rmSync(shortcutPath, { force: true });
+    }
+    return;
+  }
+
+  const { target, args, cwd, icon } = launchOptions();
+  const created = shell.writeShortcutLink(shortcutPath, "create", {
+    target,
+    args,
+    cwd,
+    icon,
+    iconIndex: 0,
+    appUserModelId: "app.cachette.vault",
+    description: "Open Cachette Vault"
+  });
+
+  if (!created) {
+    throw new Error("Could not create desktop shortcut.");
+  }
+}
+
+function runAtStartupEnabled(): boolean {
+  return app.getLoginItemSettings(loginItemOptions()).openAtLogin;
+}
+
+function setRunAtStartup(enabled: boolean): void {
+  const loginItem = loginItemOptions();
+  app.setLoginItemSettings({
+    openAtLogin: enabled,
+    enabled,
+    name: SERVICE_NAME,
+    path: loginItem.path,
+    args: loginItem.args
+  });
 }
 
 async function loadKeytar(): Promise<KeytarModule | null> {

@@ -2,6 +2,7 @@
 
 import {
   Check,
+  Clock,
   Copy,
   Download,
   Edit3,
@@ -24,7 +25,6 @@ import {
   Settings,
   Shield,
   Sun,
-  Tag,
   Trash2,
   Upload,
   X
@@ -34,11 +34,13 @@ import type { ComponentType, FormEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
   AttachmentPreview,
+  BackupImportMode,
   CachetteApi,
   ItemDraft,
   ItemFilters,
   ItemType,
   ItemUpdate,
+  PickedFile,
   VaultItem,
   VaultSettings,
   VaultStatus
@@ -47,6 +49,7 @@ import { AddItemModal } from "./AddItemModal";
 import { MarkdownPreview } from "./MarkdownPreview";
 
 type Theme = "dark" | "light";
+type SettingsPanel = "password" | "export" | "import" | null;
 
 const TYPE_META: Record<ItemType, { label: string; icon: ComponentType<{ size?: number }>; color: string }> = {
   note: { label: "Note", icon: NotebookPen, color: "var(--tnote)" },
@@ -62,6 +65,7 @@ const TAG_COLORS = ["#f3bf4f", "#f286a8", "#4fd1c5", "#7aa7ff", "#b48cf2", "#4ad
 export function VaultApp() {
   const [api, setApi] = useState<CachetteApi | null>(null);
   const [status, setStatus] = useState<VaultStatus | null>(null);
+  const [allItems, setAllItems] = useState<VaultItem[]>([]);
   const [items, setItems] = useState<VaultItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -71,16 +75,22 @@ export function VaultApp() {
   const [theme, setTheme] = useState<Theme>("dark");
   const [modalOpen, setModalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [projectCreatorOpen, setProjectCreatorOpen] = useState(false);
+  const [projectDraft, setProjectDraft] = useState("");
   const [editingItem, setEditingItem] = useState<VaultItem | null>(null);
   const [customProjects, setCustomProjects] = useState<string[]>([]);
   const [customTags, setCustomTags] = useState<string[]>([]);
   const [autoLockMs, setAutoLockMs] = useState(90_000);
+  const [lockLeft, setLockLeft] = useState<number | null>(null);
+  const [dragOver, setDragOver] = useState(false);
   const [toast, setToast] = useState("");
 
   const lockVault = useCallback(async () => {
     if (!api) return;
     const nextStatus = await api.lockVault();
     setStatus(nextStatus);
+    setAllItems([]);
     setItems([]);
     setSelectedId(null);
   }, [api]);
@@ -120,19 +130,29 @@ export function VaultApp() {
 
   useEffect(() => {
     if (!status?.unlocked || autoLockMs <= 0) {
+      setLockLeft(null);
       return;
     }
 
-    let timeoutId = window.setTimeout(lockVault, autoLockMs);
+    let lastActivity = Date.now();
+    let timeoutId = window.setTimeout(() => void lockVault(), autoLockMs);
+    const updateCountdown = () => {
+      const left = Math.ceil((autoLockMs - (Date.now() - lastActivity)) / 1000);
+      setLockLeft(left > 0 && left <= 15 ? left : null);
+    };
     const resetTimer = () => {
+      lastActivity = Date.now();
+      setLockLeft(null);
       window.clearTimeout(timeoutId);
-      timeoutId = window.setTimeout(lockVault, autoLockMs);
+      timeoutId = window.setTimeout(() => void lockVault(), autoLockMs);
     };
     const events = ["keydown", "mousedown", "mousemove", "wheel", "touchstart"];
+    const intervalId = window.setInterval(updateCountdown, 500);
 
     events.forEach((eventName) => window.addEventListener(eventName, resetTimer, { passive: true }));
     return () => {
       window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
       events.forEach((eventName) => window.removeEventListener(eventName, resetTimer));
     };
   }, [autoLockMs, lockVault, status?.unlocked]);
@@ -147,13 +167,116 @@ export function VaultApp() {
     [category, search, tag, type]
   );
 
+  const refresh = useCallback(
+    async (nextFilters = filters) => {
+      if (!api) return;
+      const [nextAllItems, nextItems] = await Promise.all([api.listItems(), api.listItems(nextFilters)]);
+      setAllItems(nextAllItems);
+      setItems(nextItems);
+      setSelectedId((current) => current ?? nextItems[0]?.id ?? null);
+    },
+    [api, filters]
+  );
+
+  useEffect(() => {
+    if (!status?.unlocked) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        setEditingItem(null);
+        setModalOpen(true);
+      }
+      if (event.ctrlKey && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        void lockVault();
+      }
+      if (event.key === "Escape") {
+        setModalOpen(false);
+        setSettingsOpen(false);
+        setTagsOpen(false);
+        setEditingItem(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [lockVault, status?.unlocked]);
+
+  useEffect(() => {
+    if (!api || !status?.unlocked) {
+      setDragOver(false);
+      return;
+    }
+
+    const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    const handleDragOver = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      setDragOver(true);
+    };
+    const handleDragLeave = (event: DragEvent) => {
+      if (!event.relatedTarget) {
+        setDragOver(false);
+      }
+    };
+    const handleDrop = async (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      setDragOver(false);
+      const picked = Array.from(event.dataTransfer?.files ?? [])
+        .map((file) => {
+          const fileWithPath = file as File & { path?: string };
+          return fileWithPath.path ? { path: fileWithPath.path, name: file.name } : undefined;
+        })
+        .filter(Boolean) as Array<{ path: string; name: string }>;
+
+      if (!picked.length) {
+        setToast("Drop files from your desktop into the Electron app.");
+        window.setTimeout(() => setToast(""), 2600);
+        return;
+      }
+
+      try {
+        const firstFile = picked[0];
+        const created = await api.createItem({
+          type: "image",
+          title: firstFile.name.replace(/\.[^.]+$/, "") || "Dropped image",
+          category: category === "All" ? "General" : category,
+          content: "",
+          attachmentPaths: picked.map((file) => file.path)
+        });
+        await refresh();
+        setType("image");
+        setSelectedId(created.id);
+        setToast(picked.length === 1 ? "Image added to vault" : `${picked.length} images added to vault`);
+        window.setTimeout(() => setToast(""), 2600);
+      } catch (error) {
+        showError(error, setToast);
+      }
+    };
+
+    window.addEventListener("dragover", handleDragOver);
+    window.addEventListener("dragleave", handleDragLeave);
+    window.addEventListener("drop", handleDrop);
+    return () => {
+      window.removeEventListener("dragover", handleDragOver);
+      window.removeEventListener("dragleave", handleDragLeave);
+      window.removeEventListener("drop", handleDrop);
+    };
+  }, [api, category, refresh, status?.unlocked]);
+
   useEffect(() => {
     if (!api || !status?.unlocked) {
       return;
     }
 
     api
-      .listItems(filters)
+      .listItems()
+      .then((nextAllItems) => {
+        setAllItems(nextAllItems);
+        return api.listItems(filters);
+      })
       .then((nextItems) => {
         setItems(nextItems);
         setSelectedId((current) => current ?? nextItems[0]?.id ?? null);
@@ -162,20 +285,13 @@ export function VaultApp() {
   }, [api, filters, status?.unlocked]);
 
   const categories = useMemo(() => {
-    const names = new Set([...customProjects, ...items.map((item) => item.category)]);
+    const names = new Set([...customProjects, ...allItems.map((item) => item.category)]);
     return ["General", ...Array.from(names).filter((name) => name !== "General").sort()];
-  }, [customProjects, items]);
+  }, [allItems, customProjects]);
 
   const sidebarCategories = useMemo(() => ["All", ...categories], [categories]);
-  const tags = useMemo(() => Array.from(new Set([...customTags, ...items.flatMap((item) => item.tags)])).sort(), [customTags, items]);
+  const tags = useMemo(() => Array.from(new Set([...customTags, ...allItems.flatMap((item) => item.tags)])).sort(), [allItems, customTags]);
   const selected = items.find((item) => item.id === selectedId) ?? items[0];
-
-  async function refresh(nextFilters = filters) {
-    if (!api) return;
-    const nextItems = await api.listItems(nextFilters);
-    setItems(nextItems);
-    setSelectedId((current) => current ?? nextItems[0]?.id ?? null);
-  }
 
   async function handleSave(draft: ItemDraft) {
     if (!api) return;
@@ -194,119 +310,113 @@ export function VaultApp() {
     flash("Item updated");
   }
 
-  function addProject() {
-    const name = window.prompt("Project name")?.trim();
+  function addProject(name: string) {
+    name = name.trim();
     if (!name) return;
     setCustomProjects((current) => Array.from(new Set([...current, name])).sort());
     setCategory(name);
     setTag(undefined);
+    setSelectedId(null);
+    setProjectDraft("");
+    setProjectCreatorOpen(false);
+    flash("Folder added");
   }
 
-  function addTag() {
-    const name = window.prompt("Tag name")?.trim().replace(/^#/, "").toLowerCase();
+  function submitProject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    addProject(projectDraft);
+  }
+
+  function addCustomTag(name: string) {
+    name = name.trim().replace(/^#/, "").toLowerCase();
     if (!name) return;
     setCustomTags((current) => Array.from(new Set([...current, name])).sort());
     setTag(name);
     setCategory("All");
   }
 
-  async function runWindowAction(action: () => Promise<boolean>) {
-    try {
-      const handled = await action();
-      if (!handled) {
-        flash("Window controls are available in the desktop app.");
-      }
-    } catch (error) {
-      showError(error, setToast);
-    }
-  }
-
   if (!api || !status) {
-    return <LoadingShell />;
+    return (
+      <AppFrame>
+        <LoadingShell />
+      </AppFrame>
+    );
   }
 
   if (!status.initialized) {
-    return <SetupScreen api={api} onStatus={setStatus} status={status} />;
+    return (
+      <AppFrame api={api}>
+        <SetupScreen api={api} onStatus={setStatus} status={status} />
+      </AppFrame>
+    );
   }
 
   if (!status.unlocked) {
-    return <UnlockScreen api={api} onStatus={setStatus} status={status} />;
+    return (
+      <AppFrame api={api}>
+        <UnlockScreen api={api} onStatus={setStatus} status={status} />
+      </AppFrame>
+    );
   }
 
   return (
-    <main className="app-shell">
-      <header className="titlebar">
-        <LogoMark className="brand-mark" />
-        <strong>Cachette</strong>
-        <span>local vault</span>
-        <div className="titlebar-actions">
-          <button className="icon-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Toggle theme">
-            {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
-          </button>
-          <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
-            <Settings size={17} />
-          </button>
-          <button className="icon-button" onClick={lockVault} aria-label="Lock vault">
-            <Lock size={17} />
-          </button>
-        </div>
-        <div className="window-controls">
-          <button
-            className="window-minimize"
-            type="button"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={() => runWindowAction(api.windowMinimize)}
-            aria-label="Minimize window"
-          />
-          <button
-            className="window-maximize"
-            type="button"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={() => runWindowAction(api.windowToggleMaximize)}
-            aria-label="Maximize window"
-          />
-          <button
-            type="button"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={() => runWindowAction(api.windowClose)}
-            aria-label="Close window"
-          >
-            x
-          </button>
-        </div>
-      </header>
-
+    <AppFrame
+      api={api}
+      lockLeft={lockLeft}
+      onLock={lockVault}
+      onSettings={() => setSettingsOpen(true)}
+      onTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
+      onToast={flash}
+      theme={theme}
+      unlocked
+    >
       <section className="vault-layout">
         <aside className="sidebar">
           <nav className="nav-section" aria-label="Categories">
             <div className="nav-section-head">
               <span className="eyebrow">Projects</span>
-              <button className="nav-add-button" type="button" onClick={addProject} aria-label="Add project">
+              <button className="nav-add-button" type="button" onClick={() => setProjectCreatorOpen((open) => !open)} aria-label="Add folder">
                 <FolderPlus size={14} />
               </button>
             </div>
-            {sidebarCategories.map((name) => (
-              <button
-                key={name}
-                className={name === category ? "nav-row is-active" : "nav-row"}
-                onClick={() => {
-                  setCategory(name);
-                  setTag(undefined);
-                  setSelectedId(null);
-                }}
-              >
-                <Folder size={15} />
-                <span>{name}</span>
-                <em>{name === "All" ? items.length : items.filter((item) => item.category === name).length}</em>
-              </button>
-            ))}
+            {projectCreatorOpen && (
+              <form className="project-create-row" onSubmit={submitProject}>
+                <input
+                  autoFocus
+                  value={projectDraft}
+                  onChange={(event) => setProjectDraft(event.target.value)}
+                  placeholder="New folder name"
+                />
+                <button className="primary-button" type="submit">Add</button>
+              </form>
+            )}
+            {sidebarCategories.map((name) => {
+              const ProjectIcon = name === "All" ? Layers : Folder;
+              const projectLabel = name === "All" ? "All items" : name;
+
+              return (
+                <button
+                  key={name}
+                  className={name === category ? "nav-row is-active" : "nav-row"}
+                  onClick={() => {
+                    setCategory(name);
+                    setTag(undefined);
+                    setSelectedId(null);
+                  }}
+                >
+                  <ProjectIcon size={15} />
+                  <span>{projectLabel}</span>
+                  <em>{name === "All" ? allItems.length : allItems.filter((item) => item.category === name).length}</em>
+                </button>
+              );
+            })}
           </nav>
 
           <nav className="nav-section" aria-label="Tags">
             <div className="nav-section-head">
               <span className="eyebrow">Tags</span>
-              <button className="nav-add-button" type="button" onClick={addTag} aria-label="Add tag">
-                <Tag size={14} />
+              <button className="nav-add-button" type="button" onClick={() => setTagsOpen(true)} aria-label="Manage tags">
+                <Settings size={14} />
               </button>
             </div>
             {tags.length === 0 && <p className="empty-copy compact">Tags appear here as you add items.</p>}
@@ -321,18 +431,18 @@ export function VaultApp() {
               >
                 <span className="tag-dot" style={{ background: tagColor(name) }} />
                 <span>{name}</span>
-                <em>{items.filter((item) => item.tags.includes(name)).length}</em>
+                <em>{allItems.filter((item) => item.tags.includes(name)).length}</em>
               </button>
             ))}
           </nav>
 
           <div className="sidebar-summary">
-            <Shield size={20} />
-            <div>
-              <strong>Local vault</strong>
-              <span>{items.length} items - encrypted</span>
+              <Shield size={20} />
+              <div>
+                <strong>Local vault</strong>
+                <span>{allItems.length} items - encrypted</span>
+              </div>
             </div>
-          </div>
         </aside>
 
         <section className="list-pane">
@@ -356,8 +466,7 @@ export function VaultApp() {
           </div>
 
           <div className="list-heading">
-            <strong>{items.length} items</strong>
-            <span>{tag ? `#${tag}` : category}</span>
+            <strong>{items.length} items - {tag ? `#${tag}` : category === "All" ? "All items" : category}</strong>
           </div>
 
           <div className="item-list">
@@ -396,20 +505,58 @@ export function VaultApp() {
           autoLockMs={autoLockMs}
           onAutoLockMs={setAutoLockMs}
           onClose={() => setSettingsOpen(false)}
-          onImported={async () => {
-            setStatus(await api.vaultStatus());
-            setItems([]);
+          onImported={async (nextStatus) => {
+            setStatus(nextStatus);
             setSelectedId(null);
+            if (nextStatus.unlocked) {
+              await refresh();
+            } else {
+              setAllItems([]);
+              setItems([]);
+              setSettingsOpen(false);
+            }
           }}
           onStatus={setStatus}
+          onResetForOnboarding={async () => {
+            const nextStatus = await api.resetForOnboarding();
+            setAllItems([]);
+            setItems([]);
+            setSelectedId(null);
+            setCategory("All");
+            setTag(undefined);
+            setCustomProjects([]);
+            setCustomTags([]);
+            setSettingsOpen(false);
+            setStatus(nextStatus);
+          }}
           onTheme={setTheme}
           onToast={flash}
           status={status}
           theme={theme}
         />
       )}
-      {toast && <div className="toast">{toast}</div>}
-    </main>
+      {tagsOpen && (
+        <TagManagerModal
+          customTags={customTags}
+          items={allItems}
+          onClose={() => setTagsOpen(false)}
+          onCreate={addCustomTag}
+          onRemove={(name) => {
+            setCustomTags((current) => current.filter((item) => item !== name));
+            if (tag === name) {
+              setTag(undefined);
+            }
+          }}
+        />
+      )}
+      {dragOver && <DropOverlay />}
+      {toast && (
+        <div className="toast">
+          <Check size={14} />
+          {toast}
+        </div>
+      )}
+    </AppFrame>
   );
 
   function flash(message: string) {
@@ -418,19 +565,202 @@ export function VaultApp() {
   }
 }
 
+function AppFrame({
+  api,
+  children,
+  lockLeft,
+  onLock,
+  onSettings,
+  onTheme,
+  onToast,
+  theme,
+  unlocked = false
+}: {
+  api?: CachetteApi | null;
+  children: ReactNode;
+  lockLeft?: number | null;
+  onLock?: () => void | Promise<void>;
+  onSettings?: () => void;
+  onTheme?: () => void;
+  onToast?: (message: string) => void;
+  theme?: Theme;
+  unlocked?: boolean;
+}) {
+  async function runWindowAction(action?: () => Promise<boolean>) {
+    if (!action) {
+      onToast?.("Window controls are available in the desktop app.");
+      return;
+    }
+
+    try {
+      const handled = await action();
+      if (!handled) {
+        onToast?.("Window controls are available in the desktop app.");
+      }
+    } catch (error) {
+      onToast?.(error instanceof Error ? error.message : "Window action failed.");
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <header className="titlebar">
+        <div className="titlebar-brand">
+          <LogoMark className="brand-mark" />
+          <strong>Cachette</strong>
+          <span>local vault</span>
+        </div>
+        <div className="titlebar-spacer" />
+        {unlocked && (
+          <div className="titlebar-actions">
+            {lockLeft !== null && lockLeft !== undefined && (
+              <div className="lock-countdown" role="status">
+                <Clock size={13} />
+                Auto-lock in {lockLeft}s
+              </div>
+            )}
+            <button className="icon-button" onClick={onTheme} title="Toggle theme" type="button" aria-label="Toggle theme">
+              {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+            </button>
+            <button className="icon-button" onClick={onSettings} title="Settings" type="button" aria-label="Open settings">
+              <Settings size={17} />
+            </button>
+            <button className="icon-button lock-action" onClick={onLock} title="Lock vault (Ctrl+L)" type="button" aria-label="Lock vault">
+              <Lock size={17} />
+            </button>
+          </div>
+        )}
+        <div className="window-controls">
+          <button
+            className="window-minimize"
+            type="button"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => void runWindowAction(api?.windowMinimize)}
+            aria-label="Minimize window"
+          />
+          <button
+            className="window-maximize"
+            type="button"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => void runWindowAction(api?.windowToggleMaximize)}
+            aria-label="Maximize window"
+          />
+          <button
+            type="button"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => void runWindowAction(api?.windowClose)}
+            aria-label="Close window"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      </header>
+      <div className="app-content">{children}</div>
+    </main>
+  );
+}
+
+function TagManagerModal({
+  customTags,
+  items,
+  onClose,
+  onCreate,
+  onRemove
+}: {
+  customTags: string[];
+  items: VaultItem[];
+  onClose: () => void;
+  onCreate: (name: string) => void;
+  onRemove: (name: string) => void;
+}) {
+  const [newTag, setNewTag] = useState("");
+  const allTags = useMemo(() => Array.from(new Set([...customTags, ...items.flatMap((item) => item.tags)])).sort(), [customTags, items]);
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = newTag.trim().replace(/^#/, "").toLowerCase();
+    if (!name) return;
+    onCreate(name);
+    setNewTag("");
+  }
+
+  return (
+    <div className="modal-backdrop tags-backdrop" role="presentation">
+      <section className="tags-sheet" role="dialog" aria-modal="true" aria-label="Manage tags">
+        <div className="modal-head">
+          <strong>Manage tags</strong>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close tags">
+            <X size={17} />
+          </button>
+        </div>
+        <div className="tags-body">
+          {allTags.length === 0 && <p className="empty-copy compact">Tags appear here as you add items.</p>}
+          {allTags.map((name) => {
+            const isCustom = customTags.includes(name);
+            return (
+              <div className="tag-manager-row" key={name}>
+                <span className="tag-dot" style={{ background: tagColor(name) }} />
+                <span>{name}</span>
+                <small>{items.filter((item) => item.tags.includes(name)).length} items</small>
+                <button
+                  className="tag-delete-button"
+                  disabled={!isCustom}
+                  onClick={() => onRemove(name)}
+                  title={isCustom ? "Delete tag" : "Tags attached to items are kept with those items"}
+                  type="button"
+                  aria-label={`Delete ${name}`}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            );
+          })}
+          <form className="tag-create-row" onSubmit={submit}>
+            <input value={newTag} onChange={(event) => setNewTag(event.target.value)} placeholder="New tag name" />
+            <button className="primary-button" type="submit">Add</button>
+          </form>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DropOverlay() {
+  return (
+    <div className="drop-overlay" aria-hidden="true">
+      <div>
+        <Upload size={32} />
+        <strong>Drop to add to your vault</strong>
+        <span>Images become items in the current project</span>
+      </div>
+    </div>
+  );
+}
+
 function ItemRow({ item, active, onClick }: { item: VaultItem; active: boolean; onClick: () => void }) {
   const Icon = TYPE_META[item.type].icon;
+  const meta = [
+    TYPE_META[item.type].label,
+    item.category,
+    ...item.tags,
+    formatRelativeTime(item.updatedAt)
+  ];
+  const locked = item.type === "password" || item.type === "private" || Boolean(item.encryptedData);
 
   return (
     <button className={active ? "item-row is-active" : "item-row"} onClick={onClick}>
       <span className="type-dot" style={{ color: TYPE_META[item.type].color }}>
         <Icon size={17} />
       </span>
-      <span>
+      <span className="item-row-copy">
         <strong>{item.title}</strong>
-        <small>{item.category} {item.tags.map((tag) => `#${tag}`).join(" ")}</small>
+        <small>{meta.join(" - ")}</small>
       </span>
-      <time>{new Date(item.updatedAt).toLocaleDateString()}</time>
+      {locked && (
+        <span className="item-row-lock" aria-label="Encrypted item">
+          <Lock size={13} />
+        </span>
+      )}
     </button>
   );
 }
@@ -561,16 +891,24 @@ function DetailPane({
         <span className="detail-icon" style={{ color: TYPE_META[item.type].color }}>
           <Icon size={22} />
         </span>
-        <div>
+        <div className="detail-title-block">
           <span className="eyebrow" style={{ color: TYPE_META[item.type].color }}>{TYPE_META[item.type].label}</span>
           <h1>{item.title}</h1>
-          <p>{item.category} {item.tags.map((tag) => `#${tag}`).join(" ")}</p>
+          <div className="detail-meta-row">
+            <span>{item.category} - updated {formatRelativeTime(item.updatedAt)}</span>
+            {item.tags.map((tag) => (
+              <span className="header-tag" key={tag} style={{ color: tagColor(tag) }}>
+                <span className="tag-dot" />
+                {tag}
+              </span>
+            ))}
+          </div>
         </div>
         <div className="detail-actions">
-          <button className="icon-button" onClick={() => onEdit(item)} aria-label="Edit item">
+          <button className="icon-button detail-action-button" onClick={() => onEdit(item)} aria-label="Edit item">
             <Edit3 size={17} />
           </button>
-          <button className="icon-button danger" onClick={remove} aria-label="Delete item">
+          <button className="icon-button detail-action-button danger" onClick={remove} aria-label="Delete item">
             <Trash2 size={17} />
           </button>
         </div>
@@ -992,6 +1330,8 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [remember, setRemember] = useState(false);
+  const [createShortcut, setCreateShortcut] = useState(true);
+  const [runAtStartup, setRunAtStartup] = useState(false);
   const [error, setError] = useState("");
 
   const strength = password.length >= 18 ? 4 : password.length >= 14 ? 3 : password.length >= 10 ? 2 : password.length >= 8 ? 1 : 0;
@@ -1014,14 +1354,17 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
   async function finish() {
     setError("");
     try {
-      onStatus(await api.setupVault(password, remember && status.secureStorageAvailable));
+      const nextStatus = await api.setupVault(password, remember && status.secureStorageAvailable);
+      await api.setDesktopShortcut(createShortcut);
+      await api.setRunAtStartup(runAtStartup);
+      onStatus(nextStatus);
     } catch (setupError) {
       setError(setupError instanceof Error ? setupError.message : "Could not create vault.");
     }
   }
 
   return (
-    <main className="auth-shell onboarding-shell">
+    <section className="auth-shell onboarding-shell">
       <section className="onboarding-panel">
         <div className="step-bars" aria-label={`Onboarding step ${step + 1} of 3`}>
           {[0, 1, 2].map((index) => (
@@ -1105,14 +1448,36 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
                   <span />
                 </button>
               </div>
+              <div>
+                <span>Create desktop shortcut</span>
+                <button
+                  className={createShortcut ? "toggle is-on" : "toggle"}
+                  type="button"
+                  onClick={() => setCreateShortcut((current) => !current)}
+                  aria-pressed={createShortcut}
+                >
+                  <span />
+                </button>
+              </div>
+              <div>
+                <span>Run on Windows startup</span>
+                <button
+                  className={runAtStartup ? "toggle is-on" : "toggle"}
+                  type="button"
+                  onClick={() => setRunAtStartup((current) => !current)}
+                  aria-pressed={runAtStartup}
+                >
+                  <span />
+                </button>
+              </div>
             </div>
-            <div className="secure-storage-copy">Windows Hello stores the vault key in the Windows Credential Locker, gated by your face, fingerprint or PIN.</div>
+            <div className="secure-storage-copy">Windows Hello stores the vault key in the Windows Credential Locker. Startup and shortcut options can be changed later in Settings.</div>
             {error && <p className="form-error">{error}</p>}
             <button className="primary-button wide onboarding-primary" type="button" onClick={finish}>Enter my vault</button>
           </>
         )}
       </section>
-    </main>
+    </section>
   );
 }
 
@@ -1134,6 +1499,7 @@ function SettingsModal({
   onAutoLockMs,
   onClose,
   onImported,
+  onResetForOnboarding,
   onStatus,
   onTheme,
   onToast,
@@ -1144,15 +1510,34 @@ function SettingsModal({
   autoLockMs: number;
   onAutoLockMs: (value: number) => void;
   onClose: () => void;
-  onImported: () => Promise<void>;
+  onImported: (status: VaultStatus) => Promise<void>;
+  onResetForOnboarding: () => Promise<void>;
   onStatus: (status: VaultStatus) => void;
   onTheme: (theme: Theme) => void;
   onToast: (message: string) => void;
   status: VaultStatus;
   theme: Theme;
 }) {
-  const [settings, setSettings] = useState<VaultSettings>({ osCredentialStored: false });
+  const [settings, setSettings] = useState<VaultSettings>({
+    osCredentialStored: false,
+    desktopShortcutCreated: false,
+    runAtStartup: false,
+    developmentMode: false
+  });
   const [busy, setBusy] = useState("");
+  const [panel, setPanel] = useState<SettingsPanel>(null);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+  const [exportPassword, setExportPassword] = useState("");
+  const [exportConfirm, setExportConfirm] = useState("");
+  const [exportError, setExportError] = useState("");
+  const [importFile, setImportFile] = useState<PickedFile | null>(null);
+  const [importMode, setImportMode] = useState<BackupImportMode | "">("");
+  const [importBackupPassword, setImportBackupPassword] = useState("");
+  const [sourceMasterPassword, setSourceMasterPassword] = useState("");
+  const [importError, setImportError] = useState("");
 
   useEffect(() => {
     api.settingsStatus().then(setSettings).catch((error) => showError(error, onToast));
@@ -1172,16 +1557,163 @@ function SettingsModal({
     }
   }
 
-  async function changePassword() {
-    const currentPassword = window.prompt("Current master password");
-    const nextPassword = currentPassword ? window.prompt("New master password") : null;
-    if (!currentPassword || !nextPassword) return;
+  async function toggleDesktopShortcut() {
+    if (busy) return;
+    setBusy("shortcut");
+    try {
+      const nextSettings = await api.setDesktopShortcut(!settings.desktopShortcutCreated);
+      setSettings(nextSettings);
+      onToast(nextSettings.desktopShortcutCreated ? "Desktop shortcut created" : "Desktop shortcut removed");
+    } catch (error) {
+      showError(error, onToast);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleRunAtStartup() {
+    if (busy) return;
+    setBusy("startup");
+    try {
+      const nextSettings = await api.setRunAtStartup(!settings.runAtStartup);
+      setSettings(nextSettings);
+      onToast(nextSettings.runAtStartup ? "Cachette will run on Windows startup" : "Windows startup disabled");
+    } catch (error) {
+      showError(error, onToast);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function togglePanel(nextPanel: SettingsPanel) {
+    if (busy) return;
+    setPanel((current) => (current === nextPanel ? null : nextPanel));
+  }
+
+  function validateConfirmedPassword(password: string, confirmation: string): string {
+    if (password.length < 8) return "Use at least 8 characters.";
+    if (password !== confirmation) return "Passwords do not match.";
+    return "";
+  }
+
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPasswordError("");
+    if (currentPassword.length < 8) {
+      setPasswordError("Current password must be at least 8 characters.");
+      return;
+    }
+    const validationError = validateConfirmedPassword(nextPassword, confirmPassword);
+    if (validationError) {
+      setPasswordError(validationError);
+      return;
+    }
 
     setBusy("password");
     try {
       onStatus(await api.changeMasterPassword(currentPassword, nextPassword));
       setSettings(await api.settingsStatus());
+      setCurrentPassword("");
+      setNextPassword("");
+      setConfirmPassword("");
+      setPanel(null);
       onToast("Master password changed");
+    } catch (error) {
+      showError(error, setPasswordError);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function exportEncryptedBackup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setExportError("");
+    const validationError = validateConfirmedPassword(exportPassword, exportConfirm);
+    if (validationError) {
+      setExportError(validationError);
+      return;
+    }
+
+    setBusy("export");
+    try {
+      const result = await api.exportBackup(exportPassword);
+      setExportPassword("");
+      setExportConfirm("");
+      setPanel(null);
+      onToast(`Backup exported: ${result.filePath}`);
+    } catch (error) {
+      showError(error, setExportError);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function pickBackupFile() {
+    if (busy) return;
+    setBusy("pick-backup");
+    setImportError("");
+    try {
+      const picked = await api.pickBackupFile();
+      if (picked) setImportFile(picked);
+    } catch (error) {
+      showError(error, setImportError);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function importEncryptedBackup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setImportError("");
+    if (!importFile) {
+      setImportError("Choose a .enc backup file.");
+      return;
+    }
+    if (!importMode) {
+      setImportError("Choose Replace vault or Merge items.");
+      return;
+    }
+    if (importBackupPassword.length < 8) {
+      setImportError("Backup password must be at least 8 characters.");
+      return;
+    }
+    if (importMode === "merge" && sourceMasterPassword.length < 8) {
+      setImportError("Source vault master password must be at least 8 characters.");
+      return;
+    }
+
+    setBusy("import");
+    try {
+      const result = await api.importBackup({
+        backupPath: importFile.path,
+        backupPassword: importBackupPassword,
+        mode: importMode,
+        sourceMasterPassword: importMode === "merge" ? sourceMasterPassword : undefined
+      });
+      setImportFile(null);
+      setImportMode("");
+      setImportBackupPassword("");
+      setSourceMasterPassword("");
+      setPanel(null);
+      onStatus(result.status);
+      await onImported(result.status);
+      onToast(result.mode === "merge" ? `${result.itemCount} backup items merged` : "Backup restored. Unlock with the imported vault password.");
+    } catch (error) {
+      showError(error, setImportError);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function resetForOnboarding() {
+    if (!settings.developmentMode || busy) return;
+    const confirmed = window.confirm("Reset this development vault and return to onboarding? This deletes local dev vault data.");
+    if (!confirmed) return;
+
+    setBusy("reset");
+    try {
+      await onResetForOnboarding();
+      onToast("Returned to onboarding");
     } catch (error) {
       showError(error, onToast);
     } finally {
@@ -1232,9 +1764,66 @@ function SettingsModal({
             <div className="settings-row">
               <span>
                 <strong>Master password</strong>
+                <small>Update the password used to unlock this vault</small>
               </span>
-              <button className="mini-button" disabled={busy === "password"} onClick={changePassword} type="button">
-                Change...
+              <button className="mini-button" disabled={Boolean(busy)} onClick={() => togglePanel("password")} type="button">
+                {panel === "password" ? "Close" : "Change"}
+              </button>
+            </div>
+            {panel === "password" && (
+              <form className="settings-inline-form" onSubmit={changePassword}>
+                <label>
+                  <span>Current password</span>
+                  <input className="mono-input" type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoFocus />
+                </label>
+                <label>
+                  <span>New password</span>
+                  <input className="mono-input" type="password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} />
+                </label>
+                <label>
+                  <span>Confirm new password</span>
+                  <input className="mono-input" type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+                </label>
+                {passwordError && <p className="settings-error">{passwordError}</p>}
+                <div className="settings-form-actions">
+                  <button className="primary-button" disabled={busy === "password"} type="submit">
+                    Save password
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+
+          <span className="eyebrow">System</span>
+          <div className="settings-group">
+            <div className="settings-row">
+              <span>
+                <strong>Desktop shortcut</strong>
+                <small>Create a Cachette shortcut on your desktop</small>
+              </span>
+              <button
+                className={settings.desktopShortcutCreated ? "toggle is-on" : "toggle"}
+                disabled={busy === "shortcut"}
+                onClick={toggleDesktopShortcut}
+                type="button"
+                aria-pressed={settings.desktopShortcutCreated}
+              >
+                <span />
+              </button>
+            </div>
+            <div className="settings-row">
+              <span>
+                <strong>Run on Windows startup</strong>
+                <small>Start Cachette automatically when you sign in</small>
+              </span>
+              <button
+                className={settings.runAtStartup ? "toggle is-on" : "toggle"}
+                disabled={busy === "startup"}
+                onClick={toggleRunAtStartup}
+                type="button"
+                aria-pressed={settings.runAtStartup}
+              >
+                <span />
               </button>
             </div>
           </div>
@@ -1246,21 +1835,79 @@ function SettingsModal({
                 <strong>Export encrypted backup</strong>
                 <small>Single .enc file, sealed with your backup password</small>
               </span>
-              <button className="mini-button" type="button" onClick={() => exportBackup(api, onToast)}>
+              <button className="mini-button" disabled={Boolean(busy)} type="button" onClick={() => togglePanel("export")}>
                 <Download size={14} />
-                Export
+                {panel === "export" ? "Close" : "Export"}
               </button>
             </div>
+            {panel === "export" && (
+              <form className="settings-inline-form" onSubmit={exportEncryptedBackup}>
+                <label>
+                  <span>Backup password</span>
+                  <input className="mono-input" type="password" value={exportPassword} onChange={(event) => setExportPassword(event.target.value)} autoFocus />
+                </label>
+                <label>
+                  <span>Confirm backup password</span>
+                  <input className="mono-input" type="password" value={exportConfirm} onChange={(event) => setExportConfirm(event.target.value)} />
+                </label>
+                {exportError && <p className="settings-error">{exportError}</p>}
+                <div className="settings-form-actions">
+                  <button className="primary-button" disabled={busy === "export"} type="submit">
+                    Export backup
+                  </button>
+                </div>
+              </form>
+            )}
             <div className="settings-row">
               <span>
                 <strong>Import backup</strong>
-                <small>Merges items after checking that backup password</small>
+                <small>Choose Replace vault or Merge items before importing</small>
               </span>
-              <button className="mini-button" type="button" onClick={() => importBackup(api, onImported, onToast)}>
+              <button className="mini-button" disabled={Boolean(busy)} type="button" onClick={() => togglePanel("import")}>
                 <Upload size={14} />
-                Import...
+                {panel === "import" ? "Close" : "Import"}
               </button>
             </div>
+            {panel === "import" && (
+              <form className="settings-inline-form" onSubmit={importEncryptedBackup}>
+                <div className="file-picker-row">
+                  <span>
+                    <strong>{importFile?.name ?? "No backup selected"}</strong>
+                    {importFile && <small>{importFile.path}</small>}
+                  </span>
+                  <button className="mini-button" disabled={busy === "pick-backup"} type="button" onClick={pickBackupFile}>
+                    <File size={14} />
+                    Choose
+                  </button>
+                </div>
+                <div className="segmented-control" role="group" aria-label="Import mode">
+                  <button className={importMode === "replace" ? "is-active" : ""} type="button" onClick={() => setImportMode("replace")}>
+                    Replace vault
+                  </button>
+                  <button className={importMode === "merge" ? "is-active" : ""} type="button" onClick={() => setImportMode("merge")}>
+                    Merge items
+                  </button>
+                </div>
+                {importMode === "replace" && <p className="settings-warning">Replace deletes the current local vault data and locks the app after restore.</p>}
+                {importMode === "merge" && <p className="settings-warning">Merge keeps this vault password and adds imported items with new IDs.</p>}
+                <label>
+                  <span>Backup password</span>
+                  <input className="mono-input" type="password" value={importBackupPassword} onChange={(event) => setImportBackupPassword(event.target.value)} />
+                </label>
+                {importMode === "merge" && (
+                  <label>
+                    <span>Source vault master password</span>
+                    <input className="mono-input" type="password" value={sourceMasterPassword} onChange={(event) => setSourceMasterPassword(event.target.value)} />
+                  </label>
+                )}
+                {importError && <p className="settings-error">{importError}</p>}
+                <div className="settings-form-actions">
+                  <button className="primary-button" disabled={busy === "import"} type="submit">
+                    Import backup
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
 
           <span className="eyebrow">Appearance</span>
@@ -1274,6 +1921,23 @@ function SettingsModal({
               Light
             </button>
           </div>
+
+          {settings.developmentMode && (
+            <>
+              <span className="eyebrow">Development</span>
+              <div className="settings-group">
+                <div className="settings-row">
+                  <span>
+                    <strong>Return to onboarding</strong>
+                    <small>Reset the development vault and show setup again</small>
+                  </span>
+                  <button className="mini-button danger" disabled={busy === "reset"} onClick={resetForOnboarding} type="button">
+                    Reset
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </section>
     </div>
@@ -1305,6 +1969,25 @@ function stripLegacyRepoRemote(content: string) {
 
 function uniqueStrings(values: Array<string | undefined>) {
   return Array.from(new Set(values.map((value) => value?.trim()).filter(Boolean))) as string[];
+}
+
+function formatRelativeTime(value: string) {
+  const then = new Date(value).getTime();
+  if (!Number.isFinite(then)) return new Date(value).toLocaleDateString();
+
+  const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (seconds < 60) return "just now";
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+
+  const days = Math.floor(hours / 24);
+  if (days < 14) return `${days}d ago`;
+
+  return new Date(value).toLocaleDateString();
 }
 
 function tagColor(name: string) {
@@ -1339,7 +2022,7 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
   }
 
   return (
-    <main className="auth-shell lock-shell">
+    <section className="auth-shell lock-shell">
       <form className="auth-form" onSubmit={unlock}>
         <div className="lock-badge">
           <MascotMark className="lock-mascot" />
@@ -1362,7 +2045,7 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
           </button>
         )}
       </form>
-    </main>
+    </section>
   );
 }
 
@@ -1382,13 +2065,13 @@ function EmptyList({ onAdd }: { onAdd: () => void }) {
 
 function LoadingShell() {
   return (
-    <main className="auth-shell">
+    <section className="auth-shell">
       <section className="auth-panel">
         <LogoMark className="brand-lock pulse" />
         <h1>Opening vault</h1>
         <p>Preparing the local shell.</p>
       </section>
-    </main>
+    </section>
   );
 }
 
@@ -1433,22 +2116,6 @@ function MascotMark({ className }: { className?: string }) {
   );
 }
 
-async function exportBackup(api: CachetteApi, toast: (message: string) => void) {
-  const password = window.prompt("Choose a password for this encrypted backup.");
-  if (!password) return;
-  const result = await api.exportBackup(password);
-  toast(`Backup exported: ${result.filePath}`);
-}
-
-async function importBackup(api: CachetteApi, onImported: () => Promise<void>, toast: (message: string) => void) {
-  const backupPath = window.prompt("Paste the .enc backup file path to import.");
-  const password = backupPath ? window.prompt("Backup password") : null;
-  if (!backupPath || !password) return;
-  await api.importBackup(backupPath, password);
-  toast("Backup imported. Unlock again with the imported vault password.");
-  await onImported();
-}
-
 function showError(error: unknown, setMessage: (message: string) => void) {
   setMessage(error instanceof Error ? error.message : "Something went wrong.");
 }
@@ -1456,6 +2123,8 @@ function showError(error: unknown, setMessage: (message: string) => void) {
 function createBrowserFallbackApi(): CachetteApi {
   let initialized = false;
   let unlocked = false;
+  let desktopShortcutCreated = false;
+  let runAtStartup = false;
   let items: VaultItem[] = [];
 
   return {
@@ -1514,10 +2183,29 @@ function createBrowserFallbackApi(): CachetteApi {
     attachmentPreview: async () => null,
     revealSecret: async () => ({ password: "Browser preview does not decrypt secrets." }),
     exportBackup: async () => ({ filePath: "browser-preview.enc" }),
-    importBackup: async () => undefined,
-    settingsStatus: async () => ({ osCredentialStored: false }),
-    rememberWithOsStorage: async () => ({ osCredentialStored: false }),
-    forgetOsStorage: async () => ({ osCredentialStored: false }),
+    pickBackupFile: async () => ({ path: "browser-preview.enc", name: "browser-preview.enc" }),
+    importBackup: async (request) => ({
+      mode: request.mode,
+      itemCount: items.length,
+      status: { initialized, unlocked: request.mode === "merge" ? unlocked : false, secureStorageAvailable: false, itemCount: items.length }
+    }),
+    settingsStatus: async () => ({ osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true }),
+    rememberWithOsStorage: async () => ({ osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true }),
+    forgetOsStorage: async () => ({ osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true }),
+    setDesktopShortcut: async (enabled) => {
+      desktopShortcutCreated = enabled;
+      return { osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true };
+    },
+    setRunAtStartup: async (enabled) => {
+      runAtStartup = enabled;
+      return { osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true };
+    },
+    resetForOnboarding: async () => {
+      initialized = false;
+      unlocked = false;
+      items = [];
+      return { initialized, unlocked, secureStorageAvailable: false, itemCount: items.length };
+    },
     changeMasterPassword: async () => ({ initialized, unlocked, secureStorageAvailable: false, itemCount: items.length }),
     openPath: async () => undefined,
     openExternal: async (url) => {

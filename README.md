@@ -92,3 +92,7 @@ npm run dist       # Build the Windows installer
 npm run lint       # Run ESLint
 npm run typecheck  # Run TypeScript checks
 ```
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

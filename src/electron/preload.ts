@@ -3,10 +3,9 @@ import type { BackupImportRequest, CachetteApi, ItemDraft, ItemFilters, ItemUpda
 
 const api: CachetteApi = {
   vaultStatus: () => ipcRenderer.invoke("vault:status"),
-  setupVault: (masterPassword: string, rememberWithOsStorage?: boolean) =>
-    ipcRenderer.invoke("vault:setup", masterPassword, rememberWithOsStorage),
+  setupVault: (masterPassword: string) => ipcRenderer.invoke("vault:setup", masterPassword),
   unlockVault: (masterPassword: string) => ipcRenderer.invoke("vault:unlock", masterPassword),
-  unlockWithOsStorage: () => ipcRenderer.invoke("vault:unlock-os"),
+  recoverVault: (recoveryKey: string, nextMasterPassword: string) => ipcRenderer.invoke("vault:recover", recoveryKey, nextMasterPassword),
   lockVault: () => ipcRenderer.invoke("vault:lock"),
   listItems: (filters?: ItemFilters) => ipcRenderer.invoke("items:list", filters),
   createItem: (draft: ItemDraft) => ipcRenderer.invoke("items:create", draft),
@@ -20,8 +19,6 @@ const api: CachetteApi = {
   pickBackupFile: () => ipcRenderer.invoke("backup:pick"),
   importBackup: (request: BackupImportRequest) => ipcRenderer.invoke("backup:import", request),
   settingsStatus: () => ipcRenderer.invoke("settings:status"),
-  rememberWithOsStorage: () => ipcRenderer.invoke("settings:remember-os"),
-  forgetOsStorage: () => ipcRenderer.invoke("settings:forget-os"),
   setDesktopShortcut: (enabled: boolean) => ipcRenderer.invoke("settings:desktop-shortcut", enabled),
   setRunAtStartup: (enabled: boolean) => ipcRenderer.invoke("settings:run-at-startup", enabled),
   resetForOnboarding: () => ipcRenderer.invoke("dev:reset-onboarding"),

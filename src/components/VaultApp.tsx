@@ -18,6 +18,7 @@ import {
   Link2,
   Lock,
   Layers,
+  ListTodo,
   Moon,
   NotebookPen,
   Plus,
@@ -31,22 +32,27 @@ import {
 } from "lucide-react";
 import Image from "next/image";
 import type { ComponentType, FormEvent, ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AttachmentPreview,
   BackupImportMode,
   CachetteApi,
   ItemDraft,
   ItemFilters,
+  ItemContentFormat,
   ItemType,
   ItemUpdate,
   PickedFile,
+  TodoEntry,
   VaultItem,
   VaultSettings,
   VaultStatus
 } from "@/shared/types";
 import { AddItemModal } from "./AddItemModal";
 import { MarkdownPreview } from "./MarkdownPreview";
+import { NoteContentField } from "./NoteContentField";
+import { PlainTextContent, RichTextPreview } from "./RichText";
+import { createTodoId, TodoListEditor } from "./TodoListEditor";
 
 type Theme = "dark" | "light";
 type SettingsPanel = "password" | "export" | "import" | null;
@@ -57,7 +63,8 @@ const TYPE_META: Record<ItemType, { label: string; icon: ComponentType<{ size?: 
   repo: { label: "Repo", icon: FolderGit2, color: "var(--trepo)" },
   image: { label: "Image", icon: FileImage, color: "var(--timg)" },
   password: { label: "Password", icon: KeyRound, color: "var(--tpass)" },
-  private: { label: "Private", icon: Shield, color: "var(--tpass)" }
+  private: { label: "Private", icon: Shield, color: "var(--tpass)" },
+  todo: { label: "Todo", icon: ListTodo, color: "var(--ttodo)" }
 };
 
 const TAG_COLORS = ["#f3bf4f", "#f286a8", "#4fd1c5", "#7aa7ff", "#b48cf2", "#4ade80"];
@@ -346,7 +353,7 @@ export function VaultApp() {
   if (!status.initialized) {
     return (
       <AppFrame api={api}>
-        <SetupScreen api={api} onStatus={setStatus} status={status} />
+        <SetupScreen api={api} onStatus={setStatus} />
       </AppFrame>
     );
   }
@@ -458,7 +465,7 @@ export function VaultApp() {
           </div>
 
           <div className="type-tabs">
-            {(["all", "note", "link", "repo", "image", "password", "private"] as Array<ItemType | "all">).map((value) => (
+            {(["all", "note", "link", "repo", "todo", "image", "password", "private"] as Array<ItemType | "all">).map((value) => (
               <button key={value} className={value === type ? "chip is-active" : "chip"} onClick={() => setType(value)}>
                 {value === "all" ? "All" : TYPE_META[value].label}
               </button>
@@ -531,7 +538,6 @@ export function VaultApp() {
           }}
           onTheme={setTheme}
           onToast={flash}
-          status={status}
           theme={theme}
         />
       )}
@@ -819,7 +825,7 @@ function DetailPane({
       <section className="detail-pane centered">
         <Shield size={34} />
         <h2>No item selected</h2>
-        <p className="empty-copy">Add a note, link, repo, image, or password to start filling the vault.</p>
+        <p className="empty-copy">Add a note, link, repo, todo, image, or password to start filling the vault.</p>
       </section>
     );
   }
@@ -876,6 +882,13 @@ function DetailPane({
     onToast(message);
   }
 
+  async function toggleTodo(todoId: string, done: boolean) {
+    if (!item?.todos) return;
+    const todos = item.todos.map((todo) => (todo.id === todoId ? { ...todo, done } : todo));
+    await api.updateItem({ id: item.id, todos, contentFormat: "plain" });
+    await onChanged();
+  }
+
   const primaryTarget = item.url ?? item.repoPath;
   const imageAttachments = item.attachments.filter((attachment) => attachment.kind !== "file");
   const heroAttachment = imageAttachments[0];
@@ -884,6 +897,7 @@ function DetailPane({
   const repoTargets = item.type === "repo" ? uniqueStrings([item.repoPath, item.url, legacyRepoRemote]) : [];
   const detailContent = item.type === "repo" ? stripLegacyRepoRemote(item.content) : item.content;
   const showGenericAttachments = item.type !== "password";
+  const todos = item.todos ?? [];
 
   return (
     <section className="detail-pane">
@@ -997,7 +1011,15 @@ function DetailPane({
         </div>
       )}
 
-      {item.type !== "password" && (item.type === "note" ? <MarkdownPreview markdown={item.content} /> : detailContent && <p className="detail-copy">{detailContent}</p>)}
+      {item.type === "todo" && <TodoDetail todos={todos} onToggle={toggleTodo} />}
+
+      {item.type !== "password" && item.type !== "todo" && (
+        item.type === "note" ? (
+          item.contentFormat === "richtext" ? <RichTextPreview html={item.content} /> : <MarkdownPreview markdown={item.content} />
+        ) : (
+          <PlainTextContent text={detailContent} />
+        )
+      )}
 
       {showGenericAttachments && item.attachments.length > 0 && (
         <div className="attachments">
@@ -1025,8 +1047,32 @@ function DetailPane({
         </div>
       )}
 
-      {showGenericAttachments && item.attachments.length === 0 && <p className="empty-copy">No attachments for this item yet.</p>}
     </section>
+  );
+}
+
+function TodoDetail({ todos, onToggle }: { todos: TodoEntry[]; onToggle: (todoId: string, done: boolean) => Promise<void> }) {
+  const doneCount = todos.filter((todo) => todo.done).length;
+
+  if (!todos.length) {
+    return <p className="empty-copy">No tasks added yet.</p>;
+  }
+
+  return (
+    <div className="todo-detail">
+      <div className="todo-progress">
+        <span>{doneCount} of {todos.length} done</span>
+        <strong>{Math.round((doneCount / todos.length) * 100)}%</strong>
+      </div>
+      <div className="todo-detail-list">
+        {todos.map((todo) => (
+          <label className={todo.done ? "todo-detail-row is-done" : "todo-detail-row"} key={todo.id}>
+            <input type="checkbox" checked={todo.done} onChange={(event) => void onToggle(todo.id, event.target.checked)} />
+            <span>{todo.text}</span>
+          </label>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1107,7 +1153,7 @@ function PasswordDetail({ api, item, onToast }: { api: CachetteApi; item: VaultI
       {notes && (
         <div className="password-notes">
           <span className="eyebrow">Notes</span>
-          <p>{notes}</p>
+          <p className="multiline-copy">{notes}</p>
         </div>
       )}
     </div>
@@ -1137,8 +1183,13 @@ function EditItemModal({
   const [password, setPassword] = useState("");
   const [secretNotes, setSecretNotes] = useState("");
   const [noteMode, setNoteMode] = useState<"write" | "preview">("write");
+  const [noteFormat, setNoteFormat] = useState<Extract<ItemContentFormat, "markdown" | "richtext">>(
+    item.contentFormat === "richtext" ? "richtext" : "markdown"
+  );
+  const [todos, setTodos] = useState<TodoEntry[]>(item.todos?.length ? item.todos : [{ id: createTodoId(), text: "", done: false }]);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const encryptedFieldsDirty = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1146,7 +1197,7 @@ function EditItemModal({
     api
       .revealSecret(item.id)
       .then((secret) => {
-        if (cancelled) return;
+        if (cancelled || encryptedFieldsDirty.current) return;
         setUsername(secret.username ?? "");
         setPassword(secret.password ?? "");
         setSecretNotes(secret.notes ?? "");
@@ -1177,6 +1228,8 @@ function EditItemModal({
       category,
       tags,
       content,
+      contentFormat: item.type === "note" ? noteFormat : "plain",
+      todos: item.type === "todo" ? todos.filter((todo) => todo.text.trim()).map((todo) => ({ ...todo, text: todo.text.trim() })) : undefined,
       url: item.type === "link" || item.type === "password" || item.type === "repo" ? url : undefined,
       repoPath: item.type === "repo" ? repoPath : undefined
     };
@@ -1212,26 +1265,15 @@ function EditItemModal({
           </label>
 
           {item.type === "note" && (
-            <div className="markdown-field">
-              <div className="field-label-row">
-                <span>Note <em>Markdown supported</em></span>
-                <div className="segmented-control">
-                  <button type="button" className={noteMode === "write" ? "is-active" : ""} onClick={() => setNoteMode("write")}>
-                    Write
-                  </button>
-                  <button type="button" className={noteMode === "preview" ? "is-active" : ""} onClick={() => setNoteMode("preview")}>
-                    Preview
-                  </button>
-                </div>
-              </div>
-              {noteMode === "write" ? (
-                <textarea className="mono-input" value={content} onChange={(event) => setContent(event.target.value)} rows={7} />
-              ) : (
-                <div className="markdown-preview-box">
-                  <MarkdownPreview markdown={content} />
-                </div>
-              )}
-            </div>
+            <NoteContentField
+              value={content}
+              contentFormat={noteFormat}
+              mode={noteMode}
+              onChange={setContent}
+              onContentFormatChange={setNoteFormat}
+              onModeChange={setNoteMode}
+              rows={7}
+            />
           )}
 
           {item.type === "link" && (
@@ -1242,7 +1284,7 @@ function EditItemModal({
               </label>
               <label>
                 <span>Description</span>
-                <input value={content} onChange={(event) => setContent(event.target.value)} placeholder="Why is this worth keeping?" />
+                <textarea value={content} onChange={(event) => setContent(event.target.value)} rows={4} placeholder="Why is this worth keeping?" />
               </label>
             </>
           )}
@@ -1259,24 +1301,48 @@ function EditItemModal({
               </label>
               <label>
                 <span>Notes</span>
-                <input value={content} onChange={(event) => setContent(event.target.value)} placeholder="Repo notes" />
+                <textarea value={content} onChange={(event) => setContent(event.target.value)} rows={4} placeholder="Repo notes" />
               </label>
             </>
           )}
+
+          {item.type === "todo" && <TodoListEditor value={todos} onChange={setTodos} />}
 
           {item.encryptedData && (
             <>
               <label>
                 <span>Username</span>
-                <input className="mono-input" value={username} onChange={(event) => setUsername(event.target.value)} />
+                <input
+                  className="mono-input"
+                  value={username}
+                  onChange={(event) => {
+                    encryptedFieldsDirty.current = true;
+                    setUsername(event.target.value);
+                  }}
+                />
               </label>
               <label>
                 <span>Password</span>
-                <input className="mono-input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+                <input
+                  className="mono-input"
+                  type="password"
+                  value={password}
+                  onChange={(event) => {
+                    encryptedFieldsDirty.current = true;
+                    setPassword(event.target.value);
+                  }}
+                />
               </label>
               <label>
                 <span>Secret notes</span>
-                <input value={secretNotes} onChange={(event) => setSecretNotes(event.target.value)} />
+                <textarea
+                  value={secretNotes}
+                  onChange={(event) => {
+                    encryptedFieldsDirty.current = true;
+                    setSecretNotes(event.target.value);
+                  }}
+                  rows={4}
+                />
               </label>
               {item.type === "password" && (
                 <label>
@@ -1287,7 +1353,7 @@ function EditItemModal({
             </>
           )}
 
-          {item.type !== "note" && item.type !== "link" && item.type !== "repo" && !item.encryptedData && (
+          {item.type !== "note" && item.type !== "link" && item.type !== "repo" && item.type !== "todo" && !item.encryptedData && (
             <label>
               <span>Notes</span>
               <textarea value={content} onChange={(event) => setContent(event.target.value)} rows={5} />
@@ -1325,20 +1391,23 @@ function EditItemModal({
   );
 }
 
-function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: VaultStatus; onStatus: (status: VaultStatus) => void }) {
+function SetupScreen({ api, onStatus }: { api: CachetteApi; onStatus: (status: VaultStatus) => void }) {
   const [step, setStep] = useState(0);
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [remember, setRemember] = useState(false);
+  const [recoveryKeys, setRecoveryKeys] = useState<string[]>([]);
+  const [setupStatus, setSetupStatus] = useState<VaultStatus | null>(null);
+  const [savedRecoveryKeys, setSavedRecoveryKeys] = useState(false);
   const [createShortcut, setCreateShortcut] = useState(true);
   const [runAtStartup, setRunAtStartup] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   const strength = password.length >= 18 ? 4 : password.length >= 14 ? 3 : password.length >= 10 ? 2 : password.length >= 8 ? 1 : 0;
   const mismatch = confirm && password !== confirm;
   const passwordBad = password.length < 8 || password !== confirm;
 
-  function next() {
+  async function next() {
     setError("");
     if (step === 0) {
       setStep(1);
@@ -1348,26 +1417,43 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
       setError(password.length < 8 ? "Use at least 8 characters." : "Passwords do not match.");
       return;
     }
-    setStep(2);
+    setBusy(true);
+    try {
+      const result = await api.setupVault(password);
+      setSetupStatus(result.status);
+      setRecoveryKeys(result.recoveryKeys);
+      setStep(2);
+    } catch (setupError) {
+      setError(setupError instanceof Error ? setupError.message : "Could not create vault.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function finish() {
     setError("");
     try {
-      const nextStatus = await api.setupVault(password, remember && status.secureStorageAvailable);
       await api.setDesktopShortcut(createShortcut);
       await api.setRunAtStartup(runAtStartup);
-      onStatus(nextStatus);
+      onStatus(setupStatus ?? (await api.vaultStatus()));
     } catch (setupError) {
       setError(setupError instanceof Error ? setupError.message : "Could not create vault.");
     }
   }
 
+  async function copyRecoveryKey(value: string) {
+    await api.copyText(value);
+  }
+
+  async function copyAllRecoveryKeys() {
+    await api.copyText(recoveryKeys.map((key, index) => `Recovery key ${index + 1}: ${key}`).join("\n"));
+  }
+
   return (
     <section className="auth-shell onboarding-shell">
       <section className="onboarding-panel">
-        <div className="step-bars" aria-label={`Onboarding step ${step + 1} of 3`}>
-          {[0, 1, 2].map((index) => (
+        <div className="step-bars" aria-label={`Onboarding step ${step + 1} of 4`}>
+          {[0, 1, 2, 3].map((index) => (
             <span key={index} className={index <= step ? "is-active" : ""} />
           ))}
         </div>
@@ -1385,20 +1471,20 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
               <MascotMark className="mascot-mark" />
             </div>
             <h1>Everything worth keeping,<br />kept under lock.</h1>
-            <p>Cachette is a local, encrypted box for screenshots, links, repos, notes and secrets. Nothing ever leaves this machine.</p>
+            <p>Cachette is a local, encrypted box for screenshots, links, repos, notes, todos and secrets. Nothing ever leaves this machine.</p>
             <div className="feature-stack">
               <FeatureLine icon={<Shield size={17} />} title="AES-256-GCM encryption" text="Secrets are sealed field-by-field before they touch disk." />
-              <FeatureLine icon={<Layers size={17} />} title="One box, five shapes" text="Passwords, notes, links, repo paths and images - organized by project and tag." />
+              <FeatureLine icon={<Layers size={17} />} title="One box, six shapes" text="Passwords, notes, todos, links, repo paths and images - organized by project and tag." />
               <FeatureLine icon={<Download size={17} />} title="Encrypted backups" text="Export the whole vault as a single .enc file. Import it anywhere." />
             </div>
-            <button className="primary-button wide onboarding-primary" type="button" onClick={next}>Set up my vault</button>
+            <button className="primary-button wide onboarding-primary" type="button" onClick={() => void next()}>Set up my vault</button>
           </>
         )}
 
         {step === 1 && (
           <>
             <h1 className="compact-title">Create your master password</h1>
-            <p>This is the only key to your vault. It is never stored and cannot be recovered - choose something long and memorable.</p>
+            <p>This password unlocks your vault key. It is never stored, and recovery only works with one of the offline recovery keys generated next.</p>
             <div className="auth-form">
               <label>
                 <span>Master password</span>
@@ -1417,11 +1503,13 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
               <div className="inline-error">{mismatch ? "Passwords do not match." : error}</div>
               <div className="crypto-note">
                 <Shield size={17} />
-                <span>Your password is stretched with <strong>PBKDF2 (600,000 iterations)</strong> into an AES-256 key on this device. We keep a verifier hash only - never the password.</span>
+                <span>Your password is stretched with <strong>PBKDF2 (600,000 iterations)</strong> and used only to unwrap a random vault key. We keep verifier metadata only - never the password.</span>
               </div>
               <div className="onboarding-actions">
                 <button className="secondary-button" type="button" onClick={() => setStep(0)}>Back</button>
-                <button className="primary-button" type="button" disabled={passwordBad} onClick={next}>Continue</button>
+                <button className="primary-button" type="button" disabled={passwordBad || busy} onClick={() => void next()}>
+                  {busy ? "Creating..." : "Generate recovery keys"}
+                </button>
               </div>
             </div>
           </>
@@ -1429,25 +1517,43 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
 
         {step === 2 && (
           <>
+            <h1 className="compact-title">Save these recovery keys</h1>
+            <p>These are shown once. Store them somewhere offline, like a password manager printout or a safe note that is not on this unlocked computer.</p>
+            <div className="recovery-key-list">
+              {recoveryKeys.map((key, index) => (
+                <div className="recovery-key-row" key={key}>
+                  <span>Key {index + 1}</span>
+                  <code>{key}</code>
+                  <button className="icon-button" type="button" onClick={() => void copyRecoveryKey(key)} aria-label={`Copy recovery key ${index + 1}`}>
+                    <Copy size={15} />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <button className="secondary-button wide" type="button" onClick={() => void copyAllRecoveryKeys()}>
+              <Copy size={15} />
+              Copy all recovery keys
+            </button>
+            <label className="check-row recovery-confirm">
+              <input type="checkbox" checked={savedRecoveryKeys} onChange={(event) => setSavedRecoveryKeys(event.target.checked)} />
+              <span>I saved these keys somewhere offline. I understand they cannot be shown again.</span>
+            </label>
+            <div className="onboarding-actions">
+              <button className="primary-button" type="button" disabled={!savedRecoveryKeys} onClick={() => setStep(3)}>Continue</button>
+            </div>
+          </>
+        )}
+
+        {step === 3 && (
+          <>
             <div className="check-orb"><Check size={28} /></div>
             <h1 className="compact-title">Your vault is sealed</h1>
             <p>Here is how Cachette will protect what you put inside.</p>
             <div className="security-table">
               <div><span>Cipher</span><strong>AES-256-GCM</strong></div>
               <div><span>Key derivation</span><strong>PBKDF2 - 600k</strong></div>
+              <div><span>Vault key</span><strong>Wrapped, random</strong></div>
               <div><span>Storage</span><strong>SQLite - local only</strong></div>
-              <div>
-                <span>Also unlock with Windows Hello</span>
-                <button
-                  className={remember ? "toggle is-on" : "toggle"}
-                  type="button"
-                  disabled={!status.secureStorageAvailable}
-                  onClick={() => setRemember((current) => !current)}
-                  aria-pressed={remember}
-                >
-                  <span />
-                </button>
-              </div>
               <div>
                 <span>Create desktop shortcut</span>
                 <button
@@ -1471,7 +1577,7 @@ function SetupScreen({ api, status, onStatus }: { api: CachetteApi; status: Vaul
                 </button>
               </div>
             </div>
-            <div className="secure-storage-copy">Windows Hello stores the vault key in the Windows Credential Locker. Startup and shortcut options can be changed later in Settings.</div>
+            <div className="secure-storage-copy">Startup and shortcut options can be changed later in Settings. Unlocking always requires the master password or an unused recovery key.</div>
             {error && <p className="form-error">{error}</p>}
             <button className="primary-button wide onboarding-primary" type="button" onClick={finish}>Enter my vault</button>
           </>
@@ -1503,7 +1609,6 @@ function SettingsModal({
   onStatus,
   onTheme,
   onToast,
-  status,
   theme
 }: {
   api: CachetteApi;
@@ -1515,11 +1620,9 @@ function SettingsModal({
   onStatus: (status: VaultStatus) => void;
   onTheme: (theme: Theme) => void;
   onToast: (message: string) => void;
-  status: VaultStatus;
   theme: Theme;
 }) {
   const [settings, setSettings] = useState<VaultSettings>({
-    osCredentialStored: false,
     desktopShortcutCreated: false,
     runAtStartup: false,
     developmentMode: false
@@ -1542,20 +1645,6 @@ function SettingsModal({
   useEffect(() => {
     api.settingsStatus().then(setSettings).catch((error) => showError(error, onToast));
   }, [api, onToast]);
-
-  async function toggleOsCredential() {
-    if (!status.secureStorageAvailable || busy) return;
-    setBusy("os");
-    try {
-      const nextSettings = settings.osCredentialStored ? await api.forgetOsStorage() : await api.rememberWithOsStorage();
-      setSettings(nextSettings);
-      onToast(nextSettings.osCredentialStored ? "Windows Hello unlock enabled" : "Windows Hello unlock disabled");
-    } catch (error) {
-      showError(error, onToast);
-    } finally {
-      setBusy("");
-    }
-  }
 
   async function toggleDesktopShortcut() {
     if (busy) return;
@@ -1746,21 +1835,6 @@ function SettingsModal({
                 <option value={0}>Never</option>
               </select>
             </label>
-            <div className="settings-row">
-              <span>
-                <strong>Windows Hello unlock</strong>
-                <small>Key held in Windows Credential Locker</small>
-              </span>
-              <button
-                className={settings.osCredentialStored ? "toggle is-on" : "toggle"}
-                disabled={!status.secureStorageAvailable || busy === "os"}
-                onClick={toggleOsCredential}
-                type="button"
-                aria-pressed={settings.osCredentialStored}
-              >
-                <span />
-              </button>
-            </div>
             <div className="settings-row">
               <span>
                 <strong>Master password</strong>
@@ -2008,7 +2082,13 @@ function readStoredList(key: string) {
 }
 
 function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: VaultStatus; onStatus: (status: VaultStatus) => void }) {
+  const [mode, setMode] = useState<"password" | "recovery">("password");
   const [password, setPassword] = useState("");
+  const [recoveryKey, setRecoveryKey] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [replacementRecoveryKey, setReplacementRecoveryKey] = useState("");
+  const [recoveredStatus, setRecoveredStatus] = useState<VaultStatus | null>(null);
   const [error, setError] = useState("");
 
   async function unlock(event: FormEvent<HTMLFormElement>) {
@@ -2021,8 +2101,34 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
     }
   }
 
+  async function recover(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+
+    if (nextPassword.length < 8) {
+      setError("Use at least 8 characters for the new master password.");
+      return;
+    }
+    if (nextPassword !== confirmPassword) {
+      setError("New master passwords do not match.");
+      return;
+    }
+
+    try {
+      const result = await api.recoverVault(recoveryKey, nextPassword);
+      setReplacementRecoveryKey(result.replacementRecoveryKey);
+      setRecoveredStatus(result.status);
+      setRecoveryKey("");
+      setNextPassword("");
+      setConfirmPassword("");
+    } catch (recoverError) {
+      setError(recoverError instanceof Error ? recoverError.message : "Could not recover vault.");
+    }
+  }
+
   return (
     <section className="auth-shell lock-shell">
+      {mode === "password" && (
       <form className="auth-form" onSubmit={unlock}>
         <div className="lock-badge">
           <MascotMark className="lock-mascot" />
@@ -2039,12 +2145,62 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
         />
         {error && <p className="form-error">{error}</p>}
         <button className="primary-button wide" type="submit">Unlock</button>
-        {status.secureStorageAvailable && (
-          <button className="secondary-button wide" type="button" onClick={() => api.unlockWithOsStorage().then(onStatus).catch((err) => showError(err, setError))}>
-            Unlock with Windows Hello
-          </button>
-        )}
+        <button className="secondary-button wide" type="button" onClick={() => { setMode("recovery"); setError(""); }}>
+          Use a recovery key
+        </button>
       </form>
+      )}
+
+      {mode === "recovery" && !replacementRecoveryKey && (
+        <form className="auth-form recovery-form" onSubmit={recover}>
+          <div className="lock-badge">
+            <KeyRound size={28} />
+          </div>
+          <h1>Recover vault</h1>
+          <p>Enter one unused recovery key, then choose a new master password. The key you use will be replaced.</p>
+          <label>
+            <span>Recovery key</span>
+            <input
+              className="mono-input lock-input"
+              value={recoveryKey}
+              onChange={(event) => setRecoveryKey(event.target.value)}
+              placeholder="CV-...."
+              autoFocus
+            />
+          </label>
+          <label>
+            <span>New master password</span>
+            <input className="mono-input lock-input" type="password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} />
+          </label>
+          <label>
+            <span>Confirm new password</span>
+            <input className="mono-input lock-input" type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+          </label>
+          {error && <p className="form-error">{error}</p>}
+          <button className="primary-button wide" type="submit">Recover and reset password</button>
+          <button className="secondary-button wide" type="button" onClick={() => { setMode("password"); setError(""); }}>
+            Back to password unlock
+          </button>
+        </form>
+      )}
+
+      {mode === "recovery" && replacementRecoveryKey && recoveredStatus && (
+        <section className="auth-form recovery-form">
+          <div className="check-orb"><Check size={28} /></div>
+          <h1>Recovery key rotated</h1>
+          <p>The recovery key you used can no longer unlock this vault. Save this replacement key somewhere offline.</p>
+          <div className="recovery-key-row single">
+            <span>New key</span>
+            <code>{replacementRecoveryKey}</code>
+            <button className="icon-button" type="button" onClick={() => void api.copyText(replacementRecoveryKey)} aria-label="Copy replacement recovery key">
+              <Copy size={15} />
+            </button>
+          </div>
+          <button className="primary-button wide" type="button" onClick={() => onStatus(recoveredStatus)}>
+            I saved it. Enter vault
+          </button>
+        </section>
+      )}
     </section>
   );
 }
@@ -2126,22 +2282,35 @@ function createBrowserFallbackApi(): CachetteApi {
   let desktopShortcutCreated = false;
   let runAtStartup = false;
   let items: VaultItem[] = [];
+  let recoveryCounter = 0;
 
   return {
-    vaultStatus: async () => ({ initialized, unlocked, secureStorageAvailable: false, itemCount: items.length }),
+    vaultStatus: async () => ({ initialized, unlocked, itemCount: items.length }),
     setupVault: async () => {
       initialized = true;
       unlocked = true;
-      return { initialized, unlocked, secureStorageAvailable: false, itemCount: items.length };
+      recoveryCounter += 1;
+      return {
+        status: { initialized, unlocked, itemCount: items.length },
+        recoveryKeys: [1, 2, 3].map((index) => `CV-BROWSER-PREVIEW-${recoveryCounter}-${index}`)
+      };
     },
     unlockVault: async () => {
       unlocked = true;
-      return { initialized, unlocked, secureStorageAvailable: false, itemCount: items.length };
+      return { initialized, unlocked, itemCount: items.length };
     },
-    unlockWithOsStorage: async () => ({ initialized, unlocked, secureStorageAvailable: false, itemCount: items.length }),
+    recoverVault: async () => {
+      initialized = true;
+      unlocked = true;
+      recoveryCounter += 1;
+      return {
+        status: { initialized, unlocked, itemCount: items.length },
+        replacementRecoveryKey: `CV-BROWSER-PREVIEW-ROTATED-${recoveryCounter}`
+      };
+    },
     lockVault: async () => {
       unlocked = false;
-      return { initialized, unlocked, secureStorageAvailable: false, itemCount: items.length };
+      return { initialized, unlocked, itemCount: items.length };
     },
     listItems: async (filters) => {
       const search = filters?.search?.toLowerCase();
@@ -2149,7 +2318,7 @@ function createBrowserFallbackApi(): CachetteApi {
         if (filters?.type && filters.type !== "all" && item.type !== filters.type) return false;
         if (filters?.category && item.category !== filters.category) return false;
         if (filters?.tag && !item.tags.includes(filters.tag)) return false;
-        return !search || `${item.title} ${item.content} ${item.tags.join(" ")}`.toLowerCase().includes(search);
+        return !search || `${item.title} ${item.content} ${item.todos?.map((todo) => todo.text).join(" ") ?? ""} ${item.tags.join(" ")}`.toLowerCase().includes(search);
       });
     },
     createItem: async (draft) => {
@@ -2159,6 +2328,8 @@ function createBrowserFallbackApi(): CachetteApi {
         type: draft.type,
         title: draft.title,
         content: draft.content ?? "",
+        contentFormat: draft.contentFormat ?? (draft.type === "note" ? "markdown" : "plain"),
+        todos: draft.type === "todo" ? draft.todos ?? [] : undefined,
         url: draft.url,
         repoPath: draft.repoPath,
         category: draft.category ?? "General",
@@ -2187,26 +2358,24 @@ function createBrowserFallbackApi(): CachetteApi {
     importBackup: async (request) => ({
       mode: request.mode,
       itemCount: items.length,
-      status: { initialized, unlocked: request.mode === "merge" ? unlocked : false, secureStorageAvailable: false, itemCount: items.length }
+      status: { initialized, unlocked: request.mode === "merge" ? unlocked : false, itemCount: items.length }
     }),
-    settingsStatus: async () => ({ osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true }),
-    rememberWithOsStorage: async () => ({ osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true }),
-    forgetOsStorage: async () => ({ osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true }),
+    settingsStatus: async () => ({ desktopShortcutCreated, runAtStartup, developmentMode: true }),
     setDesktopShortcut: async (enabled) => {
       desktopShortcutCreated = enabled;
-      return { osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true };
+      return { desktopShortcutCreated, runAtStartup, developmentMode: true };
     },
     setRunAtStartup: async (enabled) => {
       runAtStartup = enabled;
-      return { osCredentialStored: false, desktopShortcutCreated, runAtStartup, developmentMode: true };
+      return { desktopShortcutCreated, runAtStartup, developmentMode: true };
     },
     resetForOnboarding: async () => {
       initialized = false;
       unlocked = false;
       items = [];
-      return { initialized, unlocked, secureStorageAvailable: false, itemCount: items.length };
+      return { initialized, unlocked, itemCount: items.length };
     },
-    changeMasterPassword: async () => ({ initialized, unlocked, secureStorageAvailable: false, itemCount: items.length }),
+    changeMasterPassword: async () => ({ initialized, unlocked, itemCount: items.length }),
     openPath: async () => undefined,
     openExternal: async (url) => {
       window.open(url, "_blank", "noopener,noreferrer");

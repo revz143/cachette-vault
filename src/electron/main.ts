@@ -3,27 +3,28 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { VaultDatabase } from "./db";
-import type { BackupImportRequest, ItemDraft, ItemFilters, ItemUpdate, VaultSettings, VaultStatus } from "../shared/types";
+import type { BackupImportRequest, ItemDraft, ItemFilters, ItemUpdate, VaultSettings } from "../shared/types";
 
 const SERVICE_NAME = "Cachette Vault";
-const SECURE_STORAGE_ACCOUNT = "vault-derived-key";
 const APP_ICON_PATH = path.join(app.getAppPath(), "assets", "icon.ico");
 const SHORTCUT_NAME = "Cachette Vault.lnk";
 
 let mainWindow: BrowserWindow | null = null;
 let vault: VaultDatabase;
 
-type KeytarModule = {
-  setPassword: (service: string, account: string, password: string) => Promise<void>;
-  getPassword: (service: string, account: string) => Promise<string | null>;
-  deletePassword?: (service: string, account: string) => Promise<boolean>;
-};
-
-const itemTypeSchema = z.enum(["note", "link", "repo", "image", "password", "private"]);
+const itemTypeSchema = z.enum(["note", "link", "repo", "image", "password", "private", "todo"]);
+const contentFormatSchema = z.enum(["markdown", "richtext", "plain"]);
+const todoEntrySchema = z.object({
+  id: z.string().min(1),
+  text: z.string(),
+  done: z.boolean()
+});
 const itemDraftSchema = z.object({
   type: itemTypeSchema,
   title: z.string().min(1).max(180),
   content: z.string().optional(),
+  contentFormat: contentFormatSchema.optional(),
+  todos: z.array(todoEntrySchema).optional(),
   url: z.string().optional(),
   repoPath: z.string().optional(),
   category: z.string().optional(),
@@ -111,35 +112,27 @@ async function createWindow(): Promise<void> {
 }
 
 function registerIpc(): void {
-  ipcMain.handle("vault:status", async () => withSecureStorage(vault.status()));
+  ipcMain.handle("vault:status", async () => vault.status());
 
-  ipcMain.handle("vault:setup", async (_event, masterPassword: string, rememberWithOsStorage?: boolean) => {
+  ipcMain.handle("vault:setup", async (_event, masterPassword: string) => {
     requirePassword(masterPassword);
-    vault.setup(masterPassword);
-
-    if (rememberWithOsStorage) {
-      await storeDerivedKey(vault.currentKeyForSecureStorage());
-    }
-
-    return withSecureStorage(vault.status());
+    return vault.setup(masterPassword);
   });
 
   ipcMain.handle("vault:unlock", async (_event, masterPassword: string) => {
     requirePassword(masterPassword);
-    vault.unlock(masterPassword);
-    return withSecureStorage(vault.status());
+    return vault.unlock(masterPassword);
   });
 
-  ipcMain.handle("vault:unlock-os", async () => {
-    const key = await readDerivedKey();
-    if (!key) {
-      throw new Error("No OS secure storage key is available.");
+  ipcMain.handle("vault:recover", async (_event, recoveryKey: string, nextMasterPassword: string) => {
+    if (!recoveryKey || recoveryKey.trim().length < 10) {
+      throw new Error("Recovery key is required.");
     }
-
-    return withSecureStorage(vault.unlockWithDerivedKey(key));
+    requirePassword(nextMasterPassword);
+    return vault.recoverWithRecoveryKey(recoveryKey, nextMasterPassword);
   });
 
-  ipcMain.handle("vault:lock", async () => withSecureStorage(vault.lock()));
+  ipcMain.handle("vault:lock", async () => vault.lock());
 
   ipcMain.handle("items:list", async (_event, filters?: ItemFilters) => {
     return vault.listItems(filtersSchema.parse(filters));
@@ -210,27 +203,10 @@ function registerIpc(): void {
 
   ipcMain.handle("backup:import", async (_event, request: BackupImportRequest) => {
     const parsed = backupImportSchema.parse(request);
-    const result = vault.importBackup(parsed);
-    if (result.mode === "replace") {
-      await deleteStoredDerivedKeyIfAvailable();
-    }
-    return {
-      ...result,
-      status: await withSecureStorage(result.status)
-    };
+    return vault.importBackup(parsed);
   });
 
   ipcMain.handle("settings:status", async () => settingsStatus());
-
-  ipcMain.handle("settings:remember-os", async () => {
-    await storeDerivedKey(vault.currentKeyForSecureStorage());
-    return settingsStatus();
-  });
-
-  ipcMain.handle("settings:forget-os", async () => {
-    await deleteStoredDerivedKey();
-    return settingsStatus();
-  });
 
   ipcMain.handle("settings:desktop-shortcut", async (_event, enabled: boolean) => {
     setDesktopShortcut(z.boolean().parse(enabled));
@@ -245,19 +221,14 @@ function registerIpc(): void {
   ipcMain.handle("settings:change-password", async (_event, currentPassword: string, nextPassword: string) => {
     requirePassword(currentPassword);
     requirePassword(nextPassword);
-    vault.changeMasterPassword(currentPassword, nextPassword);
-    if (await hasStoredDerivedKey()) {
-      await storeDerivedKey(vault.currentKeyForSecureStorage());
-    }
-    return withSecureStorage(vault.status());
+    return vault.changeMasterPassword(currentPassword, nextPassword);
   });
 
   ipcMain.handle("dev:reset-onboarding", async () => {
     if (!isDevelopmentMode()) {
       throw new Error("Onboarding reset is only available in development mode.");
     }
-    await deleteStoredDerivedKeyIfAvailable();
-    return withSecureStorage(vault.resetForDevelopment());
+    return vault.resetForDevelopment();
   });
 
   ipcMain.handle("shell:open-path", async (_event, targetPath: string) => {
@@ -313,60 +284,8 @@ function requirePassword(value: string): void {
   }
 }
 
-async function withSecureStorage(status: VaultStatus): Promise<VaultStatus> {
-  return {
-    ...status,
-    secureStorageAvailable: Boolean(await loadKeytar())
-  };
-}
-
-async function storeDerivedKey(keyBase64: string): Promise<void> {
-  const keytar = await loadKeytar();
-  if (!keytar) {
-    throw new Error("OS secure storage is not available on this machine.");
-  }
-  await keytar.setPassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT, keyBase64);
-}
-
-async function readDerivedKey(): Promise<string | null> {
-  const keytar = await loadKeytar();
-  if (!keytar) {
-    return null;
-  }
-  return keytar.getPassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT);
-}
-
-async function deleteStoredDerivedKey(): Promise<void> {
-  const keytar = await loadKeytar();
-  if (!keytar) {
-    throw new Error("OS secure storage is not available on this machine.");
-  }
-  if (keytar.deletePassword) {
-    await keytar.deletePassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT);
-  } else {
-    await keytar.setPassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT, "");
-  }
-}
-
-async function deleteStoredDerivedKeyIfAvailable(): Promise<void> {
-  const keytar = await loadKeytar();
-  if (!keytar) {
-    return;
-  }
-  if (keytar.deletePassword) {
-    await keytar.deletePassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT);
-  } else {
-    await keytar.setPassword(SERVICE_NAME, SECURE_STORAGE_ACCOUNT, "");
-  }
-}
-
-async function hasStoredDerivedKey(): Promise<boolean> {
-  return Boolean(await readDerivedKey());
-}
-
 async function settingsStatus(): Promise<VaultSettings> {
   return {
-    osCredentialStored: await hasStoredDerivedKey(),
     desktopShortcutCreated: desktopShortcutExists(),
     runAtStartup: runAtStartupEnabled(),
     developmentMode: isDevelopmentMode()
@@ -444,13 +363,4 @@ function setRunAtStartup(enabled: boolean): void {
     path: loginItem.path,
     args: loginItem.args
   });
-}
-
-async function loadKeytar(): Promise<KeytarModule | null> {
-  try {
-    const imported = (await import("keytar")) as unknown as KeytarModule & { default?: KeytarModule };
-    return imported.default ?? imported;
-  } catch {
-    return null;
-  }
 }

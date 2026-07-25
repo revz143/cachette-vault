@@ -3,7 +3,17 @@ import { app } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { createVaultKdf, decryptJson, deriveKey, encryptJson, verifyKey, type VaultKdf } from "./crypto";
+import {
+  createVaultKdf,
+  decryptJson,
+  deriveKey,
+  encryptJson,
+  generateRecoveryKey,
+  generateVaultKey,
+  normalizeRecoveryKey,
+  verifyKey,
+  type VaultKdf
+} from "./crypto";
 import type {
   AttachmentPreview,
   AttachmentRecord,
@@ -13,7 +23,10 @@ import type {
   ItemDraft,
   ItemFilters,
   ItemUpdate,
+  TodoEntry,
+  VaultRecoveryResult,
   VaultItem,
+  VaultSetupResult,
   VaultStatus
 } from "../shared/types";
 
@@ -22,6 +35,7 @@ type ItemRow = {
   type: VaultItem["type"];
   title: string;
   content: string;
+  content_format?: VaultItem["contentFormat"];
   url: string | null;
   repo_path: string | null;
   category: string;
@@ -49,6 +63,27 @@ type BackupPayload = {
   files: Array<{ filePath: string; data: string }>;
 };
 
+type RecoverySlot = {
+  id: string;
+  label: string;
+  kdf: VaultKdf;
+  wrappedKey: string;
+  usedAt?: string;
+};
+
+type VaultWrapping = {
+  v: 2;
+  master: {
+    kdf: VaultKdf;
+    wrappedKey: string;
+  };
+  recovery: RecoverySlot[];
+};
+
+const WRAPPING_METADATA_KEY = "vault:wrapping";
+const LEGACY_KDF_METADATA_KEY = "vault:kdf";
+const RECOVERY_KEY_COUNT = 3;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
@@ -57,9 +92,10 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 CREATE TABLE IF NOT EXISTS items (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK (type IN ('note', 'link', 'repo', 'image', 'password', 'private')),
+  type TEXT NOT NULL CHECK (type IN ('note', 'link', 'repo', 'image', 'password', 'private', 'todo')),
   title TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
+  content_format TEXT NOT NULL DEFAULT 'plain' CHECK (content_format IN ('markdown', 'richtext', 'plain')),
   url TEXT,
   repo_path TEXT,
   category TEXT NOT NULL DEFAULT 'General',
@@ -100,59 +136,113 @@ export class VaultDatabase {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.migrateItemsTable();
   }
 
-  status(secureStorageAvailable = false): VaultStatus {
+  status(): VaultStatus {
     return {
-      initialized: Boolean(this.getMetadata("vault:kdf")),
+      initialized: Boolean(this.getMetadata(WRAPPING_METADATA_KEY) || this.getMetadata(LEGACY_KDF_METADATA_KEY)),
       unlocked: Boolean(this.key),
-      secureStorageAvailable,
       itemCount: this.itemCount()
     };
   }
 
-  setup(masterPassword: string): VaultStatus {
-    if (this.getMetadata("vault:kdf")) {
+  setup(masterPassword: string): VaultSetupResult {
+    if (this.getMetadata(WRAPPING_METADATA_KEY) || this.getMetadata(LEGACY_KDF_METADATA_KEY)) {
       throw new Error("Vault is already initialized.");
     }
 
-    const { key, kdf } = createVaultKdf(masterPassword);
-    this.setMetadata("vault:kdf", JSON.stringify(kdf));
-    this.key = key;
-    return this.status();
+    const vaultKey = generateVaultKey();
+    const { key: masterKey, kdf: masterKdf } = createVaultKdf(masterPassword);
+    const recoveryKeys = Array.from({ length: RECOVERY_KEY_COUNT }, () => generateRecoveryKey());
+    const wrapping: VaultWrapping = {
+      v: 2,
+      master: {
+        kdf: masterKdf,
+        wrappedKey: encryptJson(vaultKey.toString("base64"), masterKey)
+      },
+      recovery: recoveryKeys.map((recoveryKey, index) => this.createRecoverySlot(recoveryKey, vaultKey, index))
+    };
+
+    this.setMetadata(WRAPPING_METADATA_KEY, JSON.stringify(wrapping));
+    this.key = vaultKey;
+    return {
+      status: this.status(),
+      recoveryKeys
+    };
   }
 
   unlock(masterPassword: string): VaultStatus {
-    const kdf = this.readKdf();
-    const key = deriveKey(masterPassword, kdf.salt, kdf.iterations);
+    const wrapping = this.readWrapping();
+    if (wrapping) {
+      const key = deriveKey(masterPassword, wrapping.master.kdf.salt, wrapping.master.kdf.iterations);
 
-    if (!verifyKey(key, kdf.verifier)) {
+      if (!verifyKey(key, wrapping.master.kdf.verifier)) {
+        throw new Error("Invalid master password.");
+      }
+
+      this.key = this.unwrapVaultKey(wrapping.master.wrappedKey, key);
+      return this.status();
+    }
+
+    const kdf = this.readKdf();
+    const legacyKey = deriveKey(masterPassword, kdf.salt, kdf.iterations);
+
+    if (!verifyKey(legacyKey, kdf.verifier)) {
       throw new Error("Invalid master password.");
     }
 
-    this.key = key;
+    this.key = legacyKey;
     return this.status();
-  }
-
-  unlockWithDerivedKey(keyBase64: string): VaultStatus {
-    const key = Buffer.from(keyBase64, "base64");
-    const kdf = this.readKdf();
-
-    if (!verifyKey(key, kdf.verifier)) {
-      throw new Error("Stored OS credential did not match this vault.");
-    }
-
-    this.key = key;
-    return this.status(true);
-  }
-
-  currentKeyForSecureStorage(): string {
-    return this.requireKey().toString("base64");
   }
 
   lock(): VaultStatus {
     this.key = null;
     return this.status();
+  }
+
+  recoverWithRecoveryKey(recoveryKey: string, nextMasterPassword: string): VaultRecoveryResult {
+    const wrapping = this.readWrapping();
+    if (!wrapping) {
+      throw new Error("This vault does not have recovery keys. Unlock with the master password first.");
+    }
+
+    const normalizedRecoveryKey = normalizeRecoveryKey(recoveryKey);
+    const slotIndex = wrapping.recovery.findIndex((slot) => {
+      if (slot.usedAt || !slot.wrappedKey) return false;
+      const key = deriveKey(normalizedRecoveryKey, slot.kdf.salt, slot.kdf.iterations);
+      return verifyKey(key, slot.kdf.verifier);
+    });
+
+    if (slotIndex < 0) {
+      throw new Error("Invalid or already used recovery key.");
+    }
+
+    const slot = wrapping.recovery[slotIndex];
+    const recoveryDerivedKey = deriveKey(normalizedRecoveryKey, slot.kdf.salt, slot.kdf.iterations);
+    const vaultKey = this.unwrapVaultKey(slot.wrappedKey, recoveryDerivedKey);
+    const { key: nextMasterKey, kdf: nextMasterKdf } = createVaultKdf(nextMasterPassword);
+    const replacementRecoveryKey = generateRecoveryKey();
+
+    const nextWrapping: VaultWrapping = {
+      ...wrapping,
+      master: {
+        kdf: nextMasterKdf,
+        wrappedKey: encryptJson(vaultKey.toString("base64"), nextMasterKey)
+      },
+      recovery: wrapping.recovery.map((currentSlot, index) =>
+        index === slotIndex
+          ? this.createRecoverySlot(replacementRecoveryKey, vaultKey, slotIndex)
+          : currentSlot
+      )
+    };
+
+    this.setMetadata(WRAPPING_METADATA_KEY, JSON.stringify(nextWrapping));
+    this.key = vaultKey;
+    return {
+      status: this.status(),
+      replacementRecoveryKey
+    };
   }
 
   listItems(filters: ItemFilters = {}): VaultItem[] {
@@ -176,7 +266,7 @@ export class VaultDatabase {
           return true;
         }
 
-        const haystack = [item.title, item.content, item.url, item.repoPath, item.category, item.tags.join(" ")]
+        const haystack = [item.title, item.content, item.todos?.map((todo) => todo.text).join(" "), item.url, item.repoPath, item.category, item.tags.join(" ")]
           .filter(Boolean)
           .join(" ")
           .toLowerCase();
@@ -192,14 +282,15 @@ export class VaultDatabase {
 
     this.db
       .prepare(
-        `INSERT INTO items (id, type, title, content, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @url, @repoPath, @category, @tags, @encryptedData, @createdAt, @updatedAt)`
+        `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+         VALUES (@id, @type, @title, @content, @contentFormat, @url, @repoPath, @category, @tags, @encryptedData, @createdAt, @updatedAt)`
       )
       .run({
         id,
         type: draft.type,
         title: draft.title.trim(),
-        content: draft.content ?? "",
+        content: serializeItemContent(draft),
+        contentFormat: draft.contentFormat ?? defaultContentFormat(draft.type),
         url: draft.url || null,
         repoPath: draft.repoPath || null,
         category: draft.category?.trim() || "General",
@@ -228,6 +319,7 @@ export class VaultDatabase {
          SET type = @type,
              title = @title,
              content = @content,
+             content_format = @contentFormat,
              url = @url,
              repo_path = @repoPath,
              category = @category,
@@ -240,7 +332,12 @@ export class VaultDatabase {
         id: update.id,
         type: update.type ?? current.type,
         title: update.title?.trim() ?? current.title,
-        content: update.content ?? current.content,
+        content: serializeItemContent({
+          type: update.type ?? current.type,
+          content: update.content ?? current.content,
+          todos: update.todos
+        }),
+        contentFormat: update.contentFormat ?? current.content_format ?? defaultContentFormat(update.type ?? current.type),
         url: update.url ?? current.url,
         repoPath: update.repoPath ?? current.repo_path,
         category: update.category?.trim() ?? current.category,
@@ -304,6 +401,29 @@ export class VaultDatabase {
   }
 
   changeMasterPassword(currentPassword: string, nextPassword: string): VaultStatus {
+    const wrapping = this.readWrapping();
+    if (wrapping) {
+      const currentKey = deriveKey(currentPassword, wrapping.master.kdf.salt, wrapping.master.kdf.iterations);
+
+      if (!verifyKey(currentKey, wrapping.master.kdf.verifier)) {
+        throw new Error("Current master password is incorrect.");
+      }
+
+      const vaultKey = this.unwrapVaultKey(wrapping.master.wrappedKey, currentKey);
+      const { key: nextKey, kdf: nextKdf } = createVaultKdf(nextPassword);
+      const nextWrapping: VaultWrapping = {
+        ...wrapping,
+        master: {
+          kdf: nextKdf,
+          wrappedKey: encryptJson(vaultKey.toString("base64"), nextKey)
+        }
+      };
+
+      this.setMetadata(WRAPPING_METADATA_KEY, JSON.stringify(nextWrapping));
+      this.key = vaultKey;
+      return this.status();
+    }
+
     const currentKdf = this.readKdf();
     const currentKey = deriveKey(currentPassword, currentKdf.salt, currentKdf.iterations);
 
@@ -409,6 +529,57 @@ export class VaultDatabase {
     return this.status();
   }
 
+  private migrateItemsTable(): void {
+    const table = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'items'").get() as
+      | { sql: string }
+      | undefined;
+    const columns = this.db.prepare("PRAGMA table_info(items)").all() as Array<{ name: string }>;
+    const hasContentFormat = columns.some((column) => column.name === "content_format");
+    const supportsTodo = Boolean(table?.sql.includes("'todo'"));
+
+    if (hasContentFormat && supportsTodo) {
+      return;
+    }
+
+    const contentFormatExpression = hasContentFormat
+      ? "COALESCE(content_format, CASE WHEN type = 'note' THEN 'markdown' ELSE 'plain' END)"
+      : "CASE WHEN type = 'note' THEN 'markdown' ELSE 'plain' END";
+
+    this.db.pragma("foreign_keys = OFF");
+    try {
+      this.db.exec(`
+        DROP TABLE IF EXISTS items_next;
+
+        CREATE TABLE items_next (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL CHECK (type IN ('note', 'link', 'repo', 'image', 'password', 'private', 'todo')),
+          title TEXT NOT NULL,
+          content TEXT NOT NULL DEFAULT '',
+          content_format TEXT NOT NULL DEFAULT 'plain' CHECK (content_format IN ('markdown', 'richtext', 'plain')),
+          url TEXT,
+          repo_path TEXT,
+          category TEXT NOT NULL DEFAULT 'General',
+          tags TEXT NOT NULL DEFAULT '[]',
+          encrypted_data TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        INSERT INTO items_next (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+        SELECT id, type, title, content, ${contentFormatExpression}, url, repo_path, category, tags, encrypted_data, created_at, updated_at
+        FROM items;
+
+        DROP TABLE items;
+        ALTER TABLE items_next RENAME TO items;
+        CREATE INDEX IF NOT EXISTS idx_items_type ON items(type);
+        CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);
+        CREATE INDEX IF NOT EXISTS idx_items_updated_at ON items(updated_at);
+      `);
+    } finally {
+      this.db.pragma("foreign_keys = ON");
+    }
+  }
+
   private getItem(id: string): VaultItem {
     return this.toItem(this.getRow(id));
   }
@@ -422,11 +593,14 @@ export class VaultDatabase {
   }
 
   private toItem(row: ItemRow): VaultItem {
+    const contentFormat = row.content_format ?? defaultContentFormat(row.type);
     return {
       id: row.id,
       type: row.type,
       title: row.title,
-      content: row.content,
+      content: row.type === "todo" ? "" : row.content,
+      contentFormat,
+      todos: row.type === "todo" ? parseTodoEntries(row.content) : undefined,
       url: row.url ?? undefined,
       repoPath: row.repo_path ?? undefined,
       category: row.category,
@@ -448,6 +622,13 @@ export class VaultDatabase {
       originalName: row.original_name,
       createdAt: row.created_at
     }));
+  }
+
+  private normalizeBackupItemRow(row: ItemRow): ItemRow & { content_format: VaultItem["contentFormat"] } {
+    return {
+      ...row,
+      content_format: row.content_format ?? defaultContentFormat(row.type)
+    };
   }
 
   private copyAttachment(itemId: string, sourcePath: string): AttachmentRecord {
@@ -480,8 +661,8 @@ export class VaultDatabase {
 
       const insertMeta = this.db.prepare("INSERT INTO metadata (key, value) VALUES (@key, @value)");
       const insertItem = this.db.prepare(
-        `INSERT INTO items (id, type, title, content, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
+        `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+         VALUES (@id, @type, @title, @content, @content_format, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
       );
       const insertAttachment = this.db.prepare(
         `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
@@ -489,7 +670,7 @@ export class VaultDatabase {
       );
 
       for (const row of payload.metadata) insertMeta.run(row);
-      for (const row of payload.items) insertItem.run(row);
+      for (const row of payload.items) insertItem.run(this.normalizeBackupItemRow(row));
       for (const row of payload.attachments) insertAttachment.run(row);
     });
 
@@ -507,11 +688,7 @@ export class VaultDatabase {
       throw new Error("Source vault master password is required for merge imports.");
     }
 
-    const sourceKdf = this.backupVaultKdf(payload);
-    const sourceKey = deriveKey(sourceMasterPassword, sourceKdf.salt, sourceKdf.iterations);
-    if (!verifyKey(sourceKey, sourceKdf.verifier)) {
-      throw new Error("Source vault master password is incorrect.");
-    }
+    const sourceKey = this.backupVaultKey(payload, sourceMasterPassword);
 
     const now = new Date().toISOString();
     const itemIdMap = new Map<string, string>();
@@ -528,13 +705,13 @@ export class VaultDatabase {
         encryptedData = encryptJson(clear, currentKey);
       }
 
-      return {
+      return this.normalizeBackupItemRow({
         ...item,
         id: nextId,
         encrypted_data: encryptedData,
         created_at: item.created_at || now,
         updated_at: item.updated_at || now
-      };
+      });
     });
 
     const nextAttachments = payload.attachments.flatMap((attachment) => {
@@ -561,8 +738,8 @@ export class VaultDatabase {
 
     const mergeAll = this.db.transaction(() => {
       const insertItem = this.db.prepare(
-        `INSERT INTO items (id, type, title, content, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
+        `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+         VALUES (@id, @type, @title, @content, @content_format, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
       );
       const insertAttachment = this.db.prepare(
         `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
@@ -581,16 +758,60 @@ export class VaultDatabase {
     }
   }
 
-  private backupVaultKdf(payload: BackupPayload): VaultKdf {
-    const metadata = payload.metadata.find((row) => row.key === "vault:kdf");
+  private backupVaultKey(payload: BackupPayload, sourceMasterPassword: string): Buffer {
+    const wrapping = this.backupWrapping(payload);
+    if (wrapping) {
+      const sourceMasterKey = deriveKey(sourceMasterPassword, wrapping.master.kdf.salt, wrapping.master.kdf.iterations);
+      if (!verifyKey(sourceMasterKey, wrapping.master.kdf.verifier)) {
+        throw new Error("Source vault master password is incorrect.");
+      }
+      return this.unwrapVaultKey(wrapping.master.wrappedKey, sourceMasterKey);
+    }
+
+    const metadata = payload.metadata.find((row) => row.key === LEGACY_KDF_METADATA_KEY);
     if (!metadata) {
       throw new Error("Backup is missing vault key metadata.");
     }
-    return JSON.parse(metadata.value) as VaultKdf;
+    const sourceKdf = JSON.parse(metadata.value) as VaultKdf;
+    const sourceKey = deriveKey(sourceMasterPassword, sourceKdf.salt, sourceKdf.iterations);
+    if (!verifyKey(sourceKey, sourceKdf.verifier)) {
+      throw new Error("Source vault master password is incorrect.");
+    }
+    return sourceKey;
+  }
+
+  private createRecoverySlot(recoveryKey: string, vaultKey: Buffer, index: number): RecoverySlot {
+    const normalizedRecoveryKey = normalizeRecoveryKey(recoveryKey);
+    const { key, kdf } = createVaultKdf(normalizedRecoveryKey);
+
+    return {
+      id: randomUUID(),
+      label: `Recovery key ${index + 1}`,
+      kdf,
+      wrappedKey: encryptJson(vaultKey.toString("base64"), key)
+    };
+  }
+
+  private unwrapVaultKey(wrappedKey: string, key: Buffer): Buffer {
+    const vaultKeyBase64 = decryptJson<string>(wrappedKey, key);
+    if (!vaultKeyBase64) {
+      throw new Error("Could not unlock vault key.");
+    }
+    return Buffer.from(vaultKeyBase64, "base64");
+  }
+
+  private readWrapping(): VaultWrapping | undefined {
+    const raw = this.getMetadata(WRAPPING_METADATA_KEY);
+    return raw ? (JSON.parse(raw) as VaultWrapping) : undefined;
+  }
+
+  private backupWrapping(payload: BackupPayload): VaultWrapping | undefined {
+    const metadata = payload.metadata.find((row) => row.key === WRAPPING_METADATA_KEY);
+    return metadata ? (JSON.parse(metadata.value) as VaultWrapping) : undefined;
   }
 
   private readKdf(): VaultKdf {
-    const raw = this.getMetadata("vault:kdf");
+    const raw = this.getMetadata(LEGACY_KDF_METADATA_KEY);
     if (!raw) {
       throw new Error("Vault has not been initialized.");
     }
@@ -634,4 +855,42 @@ function imageMimeType(fileName: string): string {
     ".png": "image/png",
     ".webp": "image/webp"
   }[extension] ?? "application/octet-stream";
+}
+
+function defaultContentFormat(type: VaultItem["type"]): VaultItem["contentFormat"] {
+  return type === "note" ? "markdown" : "plain";
+}
+
+function serializeItemContent(item: Pick<ItemDraft, "type" | "content" | "todos">): string {
+  if (item.type === "todo") {
+    return JSON.stringify(item.todos ?? parseTodoEntries(item.content ?? ""));
+  }
+
+  return item.content ?? "";
+}
+
+function parseTodoEntries(content: string): TodoEntry[] {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return undefined;
+        }
+
+        const candidate = entry as Partial<TodoEntry>;
+        return {
+          id: typeof candidate.id === "string" && candidate.id ? candidate.id : randomUUID(),
+          text: typeof candidate.text === "string" ? candidate.text : "",
+          done: Boolean(candidate.done)
+        };
+      })
+      .filter((entry): entry is TodoEntry => Boolean(entry?.text.trim()));
+  } catch {
+    return [];
+  }
 }

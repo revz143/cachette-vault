@@ -15,17 +15,18 @@ Cachette Vault is a local-first desktop vault for passwords, notes, links, repos
 - Custom projects and tags for organizing saved items
 - Markdown preview for notes
 - Encrypted backup import and export
-- Optional Windows Hello unlock through OS secure storage when available
+- One-time recovery keys for resetting a forgotten master password
 - Custom desktop-style UI with dark and light themes
 
 ## Security Model
 
 - The master password is never stored.
-- PBKDF2-SHA512 derives a 256-bit key from the password and a per-vault salt.
-- Sensitive payloads are encrypted with AES-256-GCM before they are written to SQLite.
-- The derived key stays in Electron main-process memory and is cleared when the vault locks.
+- A random vault key encrypts sensitive payloads with AES-256-GCM before they are written to SQLite.
+- PBKDF2-SHA512 derives wrapping keys from the master password and each recovery key.
+- Only encrypted vault-key wrappers, salts, and verifier metadata are stored; raw recovery keys are shown once.
+- A used recovery key is rotated and cannot be reused.
+- The vault key stays in Electron main-process memory and is cleared when the vault locks.
 - The preload bridge exposes a small typed API; the React renderer has no direct Node.js access.
-- `keytar` is optional and used only for OS secure storage support.
 
 This project has not been independently audited. Before production use, perform threat modeling, dependency review, memory-handling review, signing/notarization, CSP hardening, and automated security testing.
 

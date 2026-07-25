@@ -5,9 +5,10 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 CREATE TABLE IF NOT EXISTS items (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK (type IN ('note', 'link', 'repo', 'image', 'password', 'private')),
+  type TEXT NOT NULL CHECK (type IN ('note', 'link', 'repo', 'image', 'password', 'private', 'todo')),
   title TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
+  content_format TEXT NOT NULL DEFAULT 'plain' CHECK (content_format IN ('markdown', 'richtext', 'plain')),
   url TEXT,
   repo_path TEXT,
   category TEXT NOT NULL DEFAULT 'General',

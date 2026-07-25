@@ -4,6 +4,7 @@ const KDF_ITERATIONS = 600_000;
 const KEY_LENGTH = 32;
 const DIGEST = "sha512";
 const AAD = Buffer.from("cachette:v1");
+const RECOVERY_KEY_BYTES = 20;
 
 export type VaultKdf = {
   salt: string;
@@ -18,6 +19,24 @@ export type EncryptedBox = {
   tag: string;
   data: string;
 };
+
+export function generateVaultKey(): Buffer {
+  return randomBytes(KEY_LENGTH);
+}
+
+export function generateRecoveryKey(): string {
+  const body = randomBytes(RECOVERY_KEY_BYTES)
+    .toString("hex")
+    .toUpperCase()
+    .match(/.{1,4}/g)
+    ?.join("-") ?? "";
+
+  return `CV-${body}`;
+}
+
+export function normalizeRecoveryKey(value: string): string {
+  return value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
 
 export function createVaultKdf(masterPassword: string): { key: Buffer; kdf: VaultKdf } {
   const salt = randomBytes(32);

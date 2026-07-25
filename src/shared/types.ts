@@ -1,17 +1,33 @@
-export type ItemType = "note" | "link" | "repo" | "image" | "password" | "private";
+export type ItemType = "note" | "link" | "repo" | "image" | "password" | "private" | "todo";
+
+export type ItemContentFormat = "markdown" | "richtext" | "plain";
+
+export type TodoEntry = {
+  id: string;
+  text: string;
+  done: boolean;
+};
 
 export type VaultStatus = {
   initialized: boolean;
   unlocked: boolean;
-  secureStorageAvailable: boolean;
   itemCount: number;
 };
 
 export type VaultSettings = {
-  osCredentialStored: boolean;
   desktopShortcutCreated: boolean;
   runAtStartup: boolean;
   developmentMode: boolean;
+};
+
+export type VaultSetupResult = {
+  status: VaultStatus;
+  recoveryKeys: string[];
+};
+
+export type VaultRecoveryResult = {
+  status: VaultStatus;
+  replacementRecoveryKey: string;
 };
 
 export type AttachmentRecord = {
@@ -28,6 +44,8 @@ export type VaultItem = {
   type: ItemType;
   title: string;
   content: string;
+  contentFormat: ItemContentFormat;
+  todos?: TodoEntry[];
   url?: string;
   repoPath?: string;
   category: string;
@@ -42,6 +60,8 @@ export type ItemDraft = {
   type: ItemType;
   title: string;
   content?: string;
+  contentFormat?: ItemContentFormat;
+  todos?: TodoEntry[];
   url?: string;
   repoPath?: string;
   category?: string;
@@ -93,9 +113,9 @@ export type AttachmentPreview = {
 
 export type CachetteApi = {
   vaultStatus: () => Promise<VaultStatus>;
-  setupVault: (masterPassword: string, rememberWithOsStorage?: boolean) => Promise<VaultStatus>;
+  setupVault: (masterPassword: string) => Promise<VaultSetupResult>;
   unlockVault: (masterPassword: string) => Promise<VaultStatus>;
-  unlockWithOsStorage: () => Promise<VaultStatus>;
+  recoverVault: (recoveryKey: string, nextMasterPassword: string) => Promise<VaultRecoveryResult>;
   lockVault: () => Promise<VaultStatus>;
   listItems: (filters?: ItemFilters) => Promise<VaultItem[]>;
   createItem: (draft: ItemDraft) => Promise<VaultItem>;
@@ -109,8 +129,6 @@ export type CachetteApi = {
   pickBackupFile: () => Promise<PickedFile | null>;
   importBackup: (request: BackupImportRequest) => Promise<BackupImportResult>;
   settingsStatus: () => Promise<VaultSettings>;
-  rememberWithOsStorage: () => Promise<VaultSettings>;
-  forgetOsStorage: () => Promise<VaultSettings>;
   setDesktopShortcut: (enabled: boolean) => Promise<VaultSettings>;
   setRunAtStartup: (enabled: boolean) => Promise<VaultSettings>;
   resetForOnboarding: () => Promise<VaultStatus>;

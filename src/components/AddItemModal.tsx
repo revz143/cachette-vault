@@ -1,18 +1,20 @@
 "use client";
 
-import { FileImage, FolderGit2, KeyRound, Link2, NotebookPen, Upload, X } from "lucide-react";
+import { FileImage, FolderGit2, KeyRound, Link2, ListTodo, NotebookPen, Upload, X } from "lucide-react";
 import type { ComponentType, DragEvent, FormEvent } from "react";
 import { useMemo, useState } from "react";
-import type { CachetteApi, ItemDraft, ItemType, PickedFile } from "@/shared/types";
-import { MarkdownPreview } from "./MarkdownPreview";
+import type { CachetteApi, ItemContentFormat, ItemDraft, ItemType, PickedFile, TodoEntry } from "@/shared/types";
+import { NoteContentField } from "./NoteContentField";
+import { createTodoId, TodoListEditor } from "./TodoListEditor";
 
 type QuickAddType = Exclude<ItemType, "private">;
 
 const TYPES: Array<{ type: QuickAddType; label: string; desc: string; icon: ComponentType<{ size?: number }> }> = [
   { type: "password", label: "Password", desc: "Logins, API keys, secrets", icon: KeyRound },
-  { type: "note", label: "Note", desc: "Markdown notes and snippets", icon: NotebookPen },
+  { type: "note", label: "Note", desc: "Markdown or rich text", icon: NotebookPen },
   { type: "link", label: "Link", desc: "Websites worth keeping", icon: Link2 },
   { type: "repo", label: "Repo", desc: "Local paths and remotes", icon: FolderGit2 },
+  { type: "todo", label: "Todo", desc: "Checklists and action items", icon: ListTodo },
   { type: "image", label: "Image", desc: "Screenshots and references", icon: FileImage }
 ];
 
@@ -31,7 +33,9 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
   const [tagsText, setTagsText] = useState("");
   const [body, setBody] = useState("");
   const [noteMode, setNoteMode] = useState<"write" | "preview">("write");
+  const [noteFormat, setNoteFormat] = useState<Extract<ItemContentFormat, "markdown" | "richtext">>("markdown");
   const [notes, setNotes] = useState("");
+  const [todos, setTodos] = useState<TodoEntry[]>([{ id: createTodoId(), text: "", done: false }]);
   const [url, setUrl] = useState("");
   const [repoPath, setRepoPath] = useState("");
   const [remoteUrl, setRemoteUrl] = useState("");
@@ -86,9 +90,12 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
     const content =
       type === "note"
         ? body
+        : type === "todo"
+          ? ""
         : type === "link"
           ? notes
           : notes;
+    const cleanTodos = todos.filter((todo) => todo.text.trim()).map((todo) => ({ ...todo, text: todo.text.trim() }));
 
     const draft: ItemDraft = {
       type,
@@ -96,6 +103,8 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
       category,
       tags,
       content,
+      contentFormat: type === "note" ? noteFormat : "plain",
+      todos: type === "todo" ? cleanTodos : undefined,
       url: type === "link" || type === "password" ? url : undefined,
       ...(type === "repo" ? { url: remoteUrl || undefined } : {}),
       repoPath: type === "repo" ? repoPath : undefined,
@@ -193,36 +202,23 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
                     <span>Website (optional)</span>
                     <input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://" />
                   </label>
+                  <label>
+                    <span>Secret notes (optional)</span>
+                    <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={4} />
+                  </label>
                 </>
               )}
 
               {type === "note" && (
-                <div className="markdown-field">
-                  <div className="field-label-row">
-                    <span>Note <em>Markdown supported</em></span>
-                    <div className="segmented-control">
-                      <button type="button" className={noteMode === "write" ? "is-active" : ""} onClick={() => setNoteMode("write")}>
-                        Write
-                      </button>
-                      <button type="button" className={noteMode === "preview" ? "is-active" : ""} onClick={() => setNoteMode("preview")}>
-                        Preview
-                      </button>
-                    </div>
-                  </div>
-                  {noteMode === "write" ? (
-                    <textarea
-                      className="mono-input"
-                      value={body}
-                      onChange={(event) => setBody(event.target.value)}
-                      rows={6}
-                      placeholder={"# Heading\n\n- bullet\n\n**bold** and `code`"}
-                    />
-                  ) : (
-                    <div className="markdown-preview-box">
-                      <MarkdownPreview markdown={body} />
-                    </div>
-                  )}
-                </div>
+                <NoteContentField
+                  value={body}
+                  contentFormat={noteFormat}
+                  mode={noteMode}
+                  onChange={setBody}
+                  onContentFormatChange={setNoteFormat}
+                  onModeChange={setNoteMode}
+                  rows={6}
+                />
               )}
 
               {type === "link" && (
@@ -233,7 +229,7 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
                   </label>
                   <label>
                     <span>Description (optional)</span>
-                    <input value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Why is this worth keeping?" />
+                    <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={4} placeholder="Why is this worth keeping?" />
                   </label>
                 </>
               )}
@@ -248,8 +244,14 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
                     <span>Remote URL (optional)</span>
                     <input className="mono-input" value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} placeholder="https://github.com/..." />
                   </label>
+                  <label>
+                    <span>Notes (optional)</span>
+                    <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={4} placeholder="Repo notes" />
+                  </label>
                 </>
               )}
+
+              {type === "todo" && <TodoListEditor value={todos} onChange={setTodos} />}
 
               {type === "image" && (
                 <button type="button" className="quick-drop" onClick={pickFiles} onDrop={handleDrop} onDragOver={(event) => event.preventDefault()}>
@@ -310,6 +312,7 @@ function titlePlaceholder(type: QuickAddType) {
     note: "e.g. Meeting notes",
     link: "e.g. CSS grid guide",
     repo: "e.g. aurora-app",
+    todo: "e.g. Launch checklist",
     image: "e.g. Dashboard screenshot"
   }[type];
 }
@@ -320,6 +323,7 @@ function typeColor(type: QuickAddType) {
     note: "var(--tnote)",
     link: "var(--tlink)",
     repo: "var(--trepo)",
+    todo: "var(--ttodo)",
     image: "var(--timg)"
   }[type];
 }

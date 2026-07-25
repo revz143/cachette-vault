@@ -19,6 +19,7 @@
   --tlink: #4fd1c5;
   --trepo: #b48cf2;
   --timg: #f286a8;
+  --ttodo: #4ade80;
   --mask: rgba(20, 26, 40, 0.85);
   --shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
   --glow: radial-gradient(800px 500px at 70% -10%, rgba(230, 179, 77, 0.08), transparent 60%);
@@ -45,6 +46,7 @@
   --tlink: #0f766e;
   --trepo: #7c4dbe;
   --timg: #c2467c;
+  --ttodo: #15803d;
   --mask: rgba(243, 241, 234, 0.88);
   --shadow: 0 20px 60px rgba(60, 50, 20, 0.18);
   --glow: radial-gradient(800px 500px at 70% -10%, rgba(163, 116, 28, 0.06), transparent 60%);
@@ -95,6 +97,7 @@ textarea,
 select {
   color: inherit;
   font: inherit;
+  -webkit-app-region: no-drag;
 }
 
 button {
@@ -937,6 +940,10 @@ select:focus {
   margin: 0;
 }
 
+.multiline-copy {
+  white-space: pre-wrap;
+}
+
 .secret-panel {
   display: grid;
   gap: 14px;
@@ -975,6 +982,22 @@ select:focus {
   color: var(--text);
   line-height: 1.65;
   max-width: 820px;
+}
+
+.rich-text-preview {
+  color: var(--text);
+  line-height: 1.65;
+  max-width: 820px;
+}
+
+.rich-text-preview p,
+.rich-text-preview ul,
+.rich-text-preview ol {
+  margin: 0 0 12px;
+}
+
+.rich-text-preview a {
+  color: var(--accent);
 }
 
 .markdown-preview h1,
@@ -1028,6 +1051,54 @@ select:focus {
   display: grid;
   gap: 8px;
   margin-top: 22px;
+}
+
+.todo-detail {
+  display: grid;
+  gap: 12px;
+  max-width: 720px;
+}
+
+.todo-progress {
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.todo-progress strong {
+  color: var(--ttodo);
+}
+
+.todo-detail-list {
+  display: grid;
+  gap: 8px;
+}
+
+.todo-detail-row {
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto 1fr;
+  line-height: 1.45;
+  padding: 11px 12px;
+}
+
+.todo-detail-row input {
+  accent-color: var(--ttodo);
+}
+
+.todo-detail-row.is-done span {
+  color: var(--muted);
+  text-decoration: line-through;
 }
 
 .auth-shell {
@@ -1255,6 +1326,52 @@ select:focus {
 .secure-storage-copy {
   line-height: 1.45;
   margin: 2px 0 16px;
+}
+
+.recovery-key-list {
+  display: grid;
+  gap: 10px;
+  margin: 22px 0 14px;
+}
+
+.recovery-key-row {
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 48px minmax(0, 1fr) 34px;
+  min-height: 50px;
+  padding: 8px 10px 8px 13px;
+}
+
+.recovery-key-row.single {
+  grid-template-columns: 54px minmax(0, 1fr) 34px;
+  margin: 12px 0 10px;
+}
+
+.recovery-key-row > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.recovery-key-row code {
+  color: var(--text);
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.recovery-confirm {
+  align-items: flex-start;
+  line-height: 1.45;
+  margin: 16px 0 2px;
+}
+
+.recovery-form {
+  width: min(430px, calc(100vw - 40px));
 }
 
 .inline-error {
@@ -1763,6 +1880,19 @@ label span,
   margin-bottom: 0;
 }
 
+.field-label-row.compact-row {
+  margin-top: -2px;
+}
+
+.field-title {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-bottom: 7px;
+}
+
 .segmented-control {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1792,6 +1922,86 @@ label span,
   min-height: 170px;
   overflow: auto;
   padding: 12px;
+}
+
+.rich-preview-box {
+  min-height: 96px;
+}
+
+.rich-text-field {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.rich-text-toolbar {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 2px;
+  padding: 6px;
+}
+
+.rich-text-toolbar button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  display: grid;
+  height: 28px;
+  place-items: center;
+  width: 28px;
+}
+
+.rich-text-toolbar button:hover {
+  background: var(--panel2);
+  color: var(--text);
+}
+
+.rich-text-editor {
+  color: var(--text);
+  font-size: 13.5px;
+  line-height: 1.6;
+  outline: none;
+  padding: 12px;
+  -webkit-app-region: no-drag;
+}
+
+.rich-text-editor:empty::before {
+  color: var(--faint);
+  content: "Write a formatted note...";
+}
+
+.todo-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.todo-editor-list {
+  display: grid;
+  gap: 8px;
+}
+
+.todo-editor-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto 1fr auto;
+}
+
+.todo-editor-row input[type="checkbox"] {
+  accent-color: var(--ttodo);
+}
+
+.todo-editor-row .icon-button {
+  height: 36px;
+  width: 36px;
+}
+
+.add-todo-button {
+  justify-self: start;
 }
 
 label em {

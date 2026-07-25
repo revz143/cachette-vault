@@ -1,21 +1,31 @@
 # Cachette Vault
 
-Cachette Vault is a local-first desktop vault for passwords, notes, links, repository paths, screenshots, and private files. It runs as an Electron app with a Next.js/React interface and stores encrypted data locally in SQLite.
+[![Electron](https://img.shields.io/badge/Electron-33-47848F?style=flat-square&logo=electron&logoColor=white)](https://www.electronjs.org/)
+[![React](https://img.shields.io/badge/React-19-149ECA?style=flat-square&logo=react&logoColor=white)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![SQLite](https://img.shields.io/badge/SQLite-better--sqlite3-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://github.com/WiseLibs/better-sqlite3)
+
+Cachette Vault is a local-first desktop vault for passwords, notes, todos, links, repository paths, screenshots, and private entries. It runs as an Electron app with a Next.js/React interface and stores encrypted data locally in SQLite.
+
+![Cachette Vault main window](docs/cachette-vault-main.png)
 
 ## Download
 
-[Download Cachette Vault for Windows](https://github.com/YOUR_GITHUB_USERNAME/cachette-vault/releases/latest/download/Cachette-Vault-Setup-0.1.0.exe)
-
-> Replace `YOUR_GITHUB_USERNAME/cachette-vault` with your GitHub repository path after publishing the project. Upload `release/Cachette-Vault-Setup-0.1.0.exe` as a GitHub Release asset so the link works.
+[![Download Installer](https://img.shields.io/badge/%E2%AC%87%20DOWNLOAD%20INSTALLER-WINDOWS%20X64-f4b400?style=for-the-badge&labelColor=4a4a4a&color=f4b400)](https://github.com/revz143/cachette-vault/releases/latest/download/Cachette-Vault-Setup-0.1.0.exe)
 
 ## Features
 
-- Local encrypted vault for passwords, notes, links, repos, images, and private entries
-- AES-256-GCM encryption with PBKDF2-SHA512 key derivation
-- Custom projects and tags for organizing saved items
-- Markdown preview for notes
+- Local encrypted vault for passwords, notes, todos, websites, repos, images, and private entries
+- Project folders, tags, search, and item type filters
+- Markdown notes with preview plus rich text notes with rendered formatting
+- Todo items with editable checklist rows and done state
+- Repo entries with local paths, remote URLs, and multiline notes
+- Multiline descriptions and notes across item add/edit forms
 - Encrypted backup import and export
 - One-time recovery keys for resetting a forgotten master password
+- Close-to-tray behavior with tray Open, Lock vault, and Exit actions
+- Configurable global tray shortcut for opening or hiding the app
+- Windows startup and desktop shortcut settings
 - Custom desktop-style UI with dark and light themes
 
 ## Security Model
@@ -25,10 +35,17 @@ Cachette Vault is a local-first desktop vault for passwords, notes, links, repos
 - PBKDF2-SHA512 derives wrapping keys from the master password and each recovery key.
 - Only encrypted vault-key wrappers, salts, and verifier metadata are stored; raw recovery keys are shown once.
 - A used recovery key is rotated and cannot be reused.
-- The vault key stays in Electron main-process memory and is cleared when the vault locks.
+- The vault key stays in Electron main-process memory and is cleared when the vault locks or the app exits.
 - The preload bridge exposes a small typed API; the React renderer has no direct Node.js access.
 
 This project has not been independently audited. Before production use, perform threat modeling, dependency review, memory-handling review, signing/notarization, CSP hardening, and automated security testing.
+
+## Desktop Behavior
+
+- Closing the window hides Cachette to the system tray.
+- Use the tray icon or tray menu to reopen the app.
+- Use `Exit` from the tray menu to fully quit the app.
+- The tray shortcut defaults to `Ctrl + Shift + L` and can be changed or cleared in Settings.
 
 ## Development
 
@@ -57,11 +74,12 @@ release/Cachette-Vault-Setup-0.1.0.exe
 ```txt
 src/
   app/                 Next.js App Router entry and global styles
-  components/          React vault UI, detail panes, and modals
-  data/schema.sql      SQLite schema
+  components/          React vault UI, detail panes, editors, and modals
+  data/schema.sql      SQLite schema reference
   electron/            Electron main process, preload bridge, database, crypto, backups
   shared/              Shared item and API types
 assets/                Application icons and packaged assets
+docs/                  README screenshots and documentation media
 release/               Generated installer output
 ```
 

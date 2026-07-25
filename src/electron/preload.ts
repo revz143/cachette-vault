@@ -21,6 +21,7 @@ const api: CachetteApi = {
   settingsStatus: () => ipcRenderer.invoke("settings:status"),
   setDesktopShortcut: (enabled: boolean) => ipcRenderer.invoke("settings:desktop-shortcut", enabled),
   setRunAtStartup: (enabled: boolean) => ipcRenderer.invoke("settings:run-at-startup", enabled),
+  setTrayShortcut: (shortcut: string) => ipcRenderer.invoke("settings:tray-shortcut", shortcut),
   resetForOnboarding: () => ipcRenderer.invoke("dev:reset-onboarding"),
   changeMasterPassword: (currentPassword: string, nextPassword: string) =>
     ipcRenderer.invoke("settings:change-password", currentPassword, nextPassword),

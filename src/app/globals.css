@@ -1665,6 +1665,21 @@ label span,
   width: 100%;
 }
 
+.tray-shortcut-row {
+  align-items: flex-start;
+}
+
+.shortcut-config {
+  display: grid;
+  gap: 8px;
+  min-width: min(100%, 260px);
+}
+
+.shortcut-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .settings-form-actions {
   display: flex;
   justify-content: flex-end;

@@ -31,7 +31,7 @@ import {
   X
 } from "lucide-react";
 import Image from "next/image";
-import type { ComponentType, FormEvent, ReactNode } from "react";
+import type { ComponentType, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AttachmentPreview,
@@ -1625,6 +1625,8 @@ function SettingsModal({
   const [settings, setSettings] = useState<VaultSettings>({
     desktopShortcutCreated: false,
     runAtStartup: false,
+    trayShortcut: "",
+    trayShortcutRegistered: true,
     developmentMode: false
   });
   const [busy, setBusy] = useState("");
@@ -1641,9 +1643,17 @@ function SettingsModal({
   const [importBackupPassword, setImportBackupPassword] = useState("");
   const [sourceMasterPassword, setSourceMasterPassword] = useState("");
   const [importError, setImportError] = useState("");
+  const [trayShortcutDraft, setTrayShortcutDraft] = useState("");
+  const [trayShortcutError, setTrayShortcutError] = useState("");
 
   useEffect(() => {
-    api.settingsStatus().then(setSettings).catch((error) => showError(error, onToast));
+    api
+      .settingsStatus()
+      .then((nextSettings) => {
+        setSettings(nextSettings);
+        setTrayShortcutDraft(nextSettings.trayShortcut);
+      })
+      .catch((error) => showError(error, onToast));
   }, [api, onToast]);
 
   async function toggleDesktopShortcut() {
@@ -1672,6 +1682,30 @@ function SettingsModal({
     } finally {
       setBusy("");
     }
+  }
+
+  async function saveTrayShortcut(nextShortcut = trayShortcutDraft) {
+    if (busy) return;
+    setBusy("tray-shortcut");
+    setTrayShortcutError("");
+    try {
+      const nextSettings = await api.setTrayShortcut(nextShortcut);
+      setSettings(nextSettings);
+      setTrayShortcutDraft(nextSettings.trayShortcut);
+      onToast(nextSettings.trayShortcut ? `Tray shortcut saved: ${formatShortcut(nextSettings.trayShortcut)}` : "Tray shortcut cleared");
+    } catch (error) {
+      showError(error, setTrayShortcutError);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function captureTrayShortcut(event: ReactKeyboardEvent<HTMLInputElement>) {
+    event.preventDefault();
+    const shortcut = shortcutFromKeyboardEvent(event);
+    if (!shortcut) return;
+    setTrayShortcutDraft(shortcut);
+    setTrayShortcutError("");
   }
 
   function togglePanel(nextPanel: SettingsPanel) {
@@ -1900,6 +1934,48 @@ function SettingsModal({
                 <span />
               </button>
             </div>
+            <div className="settings-row tray-shortcut-row">
+              <span>
+                <strong>Tray shortcut</strong>
+                <small>Open or hide Cachette while it is in the system tray</small>
+              </span>
+              <div className="shortcut-config">
+                <input
+                  className="mono-input"
+                  value={formatShortcut(trayShortcutDraft)}
+                  onKeyDown={captureTrayShortcut}
+                  onChange={() => undefined}
+                  placeholder="Press a shortcut"
+                  aria-label="Tray shortcut"
+                  readOnly
+                />
+                <div className="shortcut-actions">
+                  <button
+                    className="mini-button"
+                    disabled={busy === "tray-shortcut" || trayShortcutDraft === settings.trayShortcut}
+                    onClick={() => void saveTrayShortcut()}
+                    type="button"
+                  >
+                    Save
+                  </button>
+                  <button
+                    className="mini-button"
+                    disabled={busy === "tray-shortcut" || !settings.trayShortcut}
+                    onClick={() => {
+                      setTrayShortcutDraft("");
+                      void saveTrayShortcut("");
+                    }}
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                </div>
+                {trayShortcutError && <p className="settings-error">{trayShortcutError}</p>}
+                {!settings.trayShortcutRegistered && settings.trayShortcut && (
+                  <p className="settings-warning">This shortcut is saved, but Windows did not register it. Choose another combination.</p>
+                )}
+              </div>
+            </div>
           </div>
 
           <span className="eyebrow">Backup</span>
@@ -2043,6 +2119,62 @@ function stripLegacyRepoRemote(content: string) {
 
 function uniqueStrings(values: Array<string | undefined>) {
   return Array.from(new Set(values.map((value) => value?.trim()).filter(Boolean))) as string[];
+}
+
+function shortcutFromKeyboardEvent(event: ReactKeyboardEvent<HTMLInputElement>) {
+  const key = normalizeShortcutKey(event.key);
+  if (!key) return "";
+
+  const parts: string[] = [];
+  if (event.ctrlKey || event.metaKey) parts.push("CommandOrControl");
+  if (event.altKey) parts.push("Alt");
+  if (event.shiftKey) parts.push("Shift");
+
+  const isFunctionKey = /^F(?:[1-9]|1\d|2[0-4])$/.test(key);
+  if (!parts.length && !isFunctionKey) {
+    return "";
+  }
+
+  parts.push(key);
+  return parts.join("+");
+}
+
+function normalizeShortcutKey(key: string) {
+  if (/^[a-z0-9]$/i.test(key)) return key.toUpperCase();
+  if (/^F(?:[1-9]|1\d|2[0-4])$/i.test(key)) return key.toUpperCase();
+  return {
+    " ": "Space",
+    ArrowDown: "Down",
+    ArrowLeft: "Left",
+    ArrowRight: "Right",
+    ArrowUp: "Up",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    End: "End",
+    Enter: "Enter",
+    Escape: "Escape",
+    Home: "Home",
+    Insert: "Insert",
+    PageDown: "PageDown",
+    PageUp: "PageUp",
+    Tab: "Tab",
+    "-": "-",
+    "=": "=",
+    ",": ",",
+    ".": ".",
+    "/": "/",
+    ";": ";",
+    "'": "'",
+    "[": "[",
+    "]": "]",
+    "\\": "\\"
+  }[key] ?? "";
+}
+
+function formatShortcut(shortcut: string) {
+  return shortcut
+    .replace(/CommandOrControl/g, "Ctrl")
+    .replace(/\+/g, " + ");
 }
 
 function formatRelativeTime(value: string) {
@@ -2281,6 +2413,7 @@ function createBrowserFallbackApi(): CachetteApi {
   let unlocked = false;
   let desktopShortcutCreated = false;
   let runAtStartup = false;
+  let trayShortcut = "CommandOrControl+Shift+L";
   let items: VaultItem[] = [];
   let recoveryCounter = 0;
 
@@ -2360,14 +2493,18 @@ function createBrowserFallbackApi(): CachetteApi {
       itemCount: items.length,
       status: { initialized, unlocked: request.mode === "merge" ? unlocked : false, itemCount: items.length }
     }),
-    settingsStatus: async () => ({ desktopShortcutCreated, runAtStartup, developmentMode: true }),
+    settingsStatus: async () => ({ desktopShortcutCreated, runAtStartup, trayShortcut, trayShortcutRegistered: true, developmentMode: true }),
     setDesktopShortcut: async (enabled) => {
       desktopShortcutCreated = enabled;
-      return { desktopShortcutCreated, runAtStartup, developmentMode: true };
+      return { desktopShortcutCreated, runAtStartup, trayShortcut, trayShortcutRegistered: true, developmentMode: true };
     },
     setRunAtStartup: async (enabled) => {
       runAtStartup = enabled;
-      return { desktopShortcutCreated, runAtStartup, developmentMode: true };
+      return { desktopShortcutCreated, runAtStartup, trayShortcut, trayShortcutRegistered: true, developmentMode: true };
+    },
+    setTrayShortcut: async (shortcut) => {
+      trayShortcut = shortcut;
+      return { desktopShortcutCreated, runAtStartup, trayShortcut, trayShortcutRegistered: true, developmentMode: true };
     },
     resetForOnboarding: async () => {
       initialized = false;

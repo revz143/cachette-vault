@@ -17,6 +17,8 @@ export type VaultStatus = {
 export type VaultSettings = {
   desktopShortcutCreated: boolean;
   runAtStartup: boolean;
+  trayShortcut: string;
+  trayShortcutRegistered: boolean;
   developmentMode: boolean;
 };
 
@@ -131,6 +133,7 @@ export type CachetteApi = {
   settingsStatus: () => Promise<VaultSettings>;
   setDesktopShortcut: (enabled: boolean) => Promise<VaultSettings>;
   setRunAtStartup: (enabled: boolean) => Promise<VaultSettings>;
+  setTrayShortcut: (shortcut: string) => Promise<VaultSettings>;
   resetForOnboarding: () => Promise<VaultStatus>;
   changeMasterPassword: (currentPassword: string, nextPassword: string) => Promise<VaultStatus>;
   openPath: (targetPath: string) => Promise<void>;

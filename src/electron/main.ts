@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, shell, Tray } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -8,9 +8,18 @@ import type { BackupImportRequest, ItemDraft, ItemFilters, ItemUpdate, VaultSett
 const SERVICE_NAME = "Cachette Vault";
 const APP_ICON_PATH = path.join(app.getAppPath(), "assets", "icon.ico");
 const SHORTCUT_NAME = "Cachette Vault.lnk";
+const APP_SETTINGS_FILE = "cachette-settings.json";
+const DEFAULT_TRAY_SHORTCUT = "CommandOrControl+Shift+L";
 
 let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
 let vault: VaultDatabase;
+let isQuitting = false;
+let registeredTrayShortcut = "";
+
+type AppSettings = {
+  trayShortcut: string;
+};
 
 const itemTypeSchema = z.enum(["note", "link", "repo", "image", "password", "private", "todo"]);
 const contentFormatSchema = z.enum(["markdown", "richtext", "plain"]);
@@ -60,13 +69,11 @@ const backupImportSchema = z
     }
   });
 
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
-});
+app.on("window-all-closed", () => undefined);
 
 app.on("before-quit", () => {
+  isQuitting = true;
+  globalShortcut.unregisterAll();
   vault?.lock();
 });
 
@@ -74,12 +81,16 @@ app.whenReady().then(async () => {
   vault = new VaultDatabase();
   Menu.setApplicationMenu(null);
   registerIpc();
+  createTray();
+  registerTrayShortcut(readAppSettings().trayShortcut);
   await createWindow();
 });
 
 app.on("activate", async () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     await createWindow();
+  } else {
+    showMainWindow();
   }
 });
 
@@ -102,6 +113,19 @@ async function createWindow(): Promise<void> {
     }
   });
 
+  mainWindow.on("close", (event) => {
+    if (isQuitting) {
+      return;
+    }
+
+    event.preventDefault();
+    mainWindow?.hide();
+  });
+
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;
   if (rendererUrl) {
     await mainWindow.loadURL(rendererUrl);
@@ -109,6 +133,92 @@ async function createWindow(): Promise<void> {
   } else {
     await mainWindow.loadFile(path.join(app.getAppPath(), "out", "index.html"));
   }
+}
+
+function createTray(): void {
+  if (tray) return;
+
+  tray = new Tray(APP_ICON_PATH);
+  tray.setToolTip("Cachette Vault");
+  tray.setContextMenu(createTrayMenu());
+  tray.on("click", () => {
+    showMainWindow();
+  });
+}
+
+function createTrayMenu(): Menu {
+  return Menu.buildFromTemplate([
+    {
+      label: "Open Cachette",
+      click: () => {
+        showMainWindow();
+      }
+    },
+    {
+      label: "Lock vault",
+      click: () => {
+        vault?.lock();
+      }
+    },
+    { type: "separator" },
+    {
+      label: "Exit",
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      }
+    }
+  ]);
+}
+
+async function toggleMainWindow(): Promise<void> {
+  if (!mainWindow || !mainWindow.isVisible() || mainWindow.isMinimized()) {
+    await showMainWindow();
+    return;
+  }
+
+  mainWindow.hide();
+}
+
+async function showMainWindow(): Promise<void> {
+  if (!mainWindow) {
+    await createWindow();
+    return;
+  }
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function registerTrayShortcut(shortcut: string): boolean {
+  if (registeredTrayShortcut) {
+    globalShortcut.unregister(registeredTrayShortcut);
+    registeredTrayShortcut = "";
+  }
+
+  const normalizedShortcut = shortcut.trim();
+  if (!normalizedShortcut) {
+    return true;
+  }
+
+  let registered = false;
+  try {
+    registered = globalShortcut.register(normalizedShortcut, () => {
+      void toggleMainWindow();
+    });
+  } catch {
+    registered = false;
+  }
+
+  if (registered) {
+    registeredTrayShortcut = normalizedShortcut;
+  }
+
+  return registered;
 }
 
 function registerIpc(): void {
@@ -218,6 +328,18 @@ function registerIpc(): void {
     return settingsStatus();
   });
 
+  ipcMain.handle("settings:tray-shortcut", async (_event, shortcut: string) => {
+    const parsed = z.string().max(80).parse(shortcut).trim();
+    const previousSettings = readAppSettings();
+    const previousShortcut = previousSettings.trayShortcut;
+    if (!registerTrayShortcut(parsed)) {
+      registerTrayShortcut(previousShortcut);
+      throw new Error("That shortcut could not be registered. Try a different combination.");
+    }
+    writeAppSettings({ ...previousSettings, trayShortcut: parsed });
+    return settingsStatus();
+  });
+
   ipcMain.handle("settings:change-password", async (_event, currentPassword: string, nextPassword: string) => {
     requirePassword(currentPassword);
     requirePassword(nextPassword);
@@ -285,11 +407,33 @@ function requirePassword(value: string): void {
 }
 
 async function settingsStatus(): Promise<VaultSettings> {
+  const appSettings = readAppSettings();
   return {
     desktopShortcutCreated: desktopShortcutExists(),
     runAtStartup: runAtStartupEnabled(),
+    trayShortcut: appSettings.trayShortcut,
+    trayShortcutRegistered: !appSettings.trayShortcut || registeredTrayShortcut === appSettings.trayShortcut,
     developmentMode: isDevelopmentMode()
   };
+}
+
+function appSettingsPath(): string {
+  return path.join(app.getPath("userData"), APP_SETTINGS_FILE);
+}
+
+function readAppSettings(): AppSettings {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(appSettingsPath(), "utf8")) as Partial<AppSettings>;
+    return {
+      trayShortcut: typeof parsed.trayShortcut === "string" ? parsed.trayShortcut : DEFAULT_TRAY_SHORTCUT
+    };
+  } catch {
+    return { trayShortcut: DEFAULT_TRAY_SHORTCUT };
+  }
+}
+
+function writeAppSettings(settings: AppSettings): void {
+  fs.writeFileSync(appSettingsPath(), JSON.stringify(settings, null, 2), { mode: 0o600 });
 }
 
 function isDevelopmentMode(): boolean {

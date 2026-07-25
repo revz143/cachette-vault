@@ -34,9 +34,6 @@ FunctionEnd
 !macro customUnInstall
   ${If} $cachetteDeleteUserData == ${BST_CHECKED}
     DetailPrint "Deleting Cachette Vault user data..."
-    DetailPrint "Deleting Cachette Vault Windows Credential Locker entry..."
-    nsExec::ExecToLog '"$SYSDIR\cmdkey.exe" /delete:"Cachette Vault/vault-derived-key"'
-    Pop $0
 
     ${If} $installMode == "all"
       SetShellVarContext current

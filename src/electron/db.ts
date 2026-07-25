@@ -3,6 +3,7 @@ import { app } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import {
   createVaultKdf,
   decryptJson,
@@ -12,6 +13,7 @@ import {
   generateVaultKey,
   normalizeRecoveryKey,
   verifyKey,
+  zeroKey,
   type VaultKdf
 } from "./crypto";
 import type {
@@ -84,6 +86,58 @@ const WRAPPING_METADATA_KEY = "vault:wrapping";
 const LEGACY_KDF_METADATA_KEY = "vault:kdf";
 const RECOVERY_KEY_COUNT = 3;
 
+const INSERT_ITEM_SQL = `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
+ VALUES (@id, @type, @title, @content, @content_format, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`;
+
+const INSERT_ATTACHMENT_SQL = `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
+ VALUES (@id, @item_id, @file_path, @kind, @original_name, @created_at)`;
+
+const vaultKdfSchema = z.object({
+  salt: z.string().min(1),
+  iterations: z.number().int().positive().max(5_000_000),
+  digest: z.string(),
+  verifier: z.string().min(1)
+});
+
+const backupEnvelopeSchema = z.object({
+  cachetteBackup: z.literal(1),
+  kdf: vaultKdfSchema,
+  payload: z.string().min(1)
+});
+
+const backupPayloadSchema = z.object({
+  version: z.literal(1),
+  exportedAt: z.string(),
+  metadata: z.array(z.object({ key: z.string(), value: z.string() })),
+  items: z.array(
+    z.object({
+      id: z.string().min(1),
+      type: z.enum(["note", "link", "repo", "image", "password", "private", "todo"]),
+      title: z.string(),
+      content: z.string(),
+      content_format: z.enum(["markdown", "richtext", "plain"]).optional(),
+      url: z.string().nullable(),
+      repo_path: z.string().nullable(),
+      category: z.string(),
+      tags: z.string(),
+      encrypted_data: z.string().nullable(),
+      created_at: z.string(),
+      updated_at: z.string()
+    })
+  ),
+  attachments: z.array(
+    z.object({
+      id: z.string().min(1),
+      item_id: z.string().min(1),
+      file_path: z.string().min(1),
+      kind: z.enum(["file", "image", "screenshot"]),
+      original_name: z.string().min(1),
+      created_at: z.string()
+    })
+  ),
+  files: z.array(z.object({ filePath: z.string().min(1), data: z.string() }))
+});
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS metadata (
   key TEXT PRIMARY KEY,
@@ -147,22 +201,27 @@ export class VaultDatabase {
     };
   }
 
-  setup(masterPassword: string): VaultSetupResult {
+  async setup(masterPassword: string): Promise<VaultSetupResult> {
     if (this.getMetadata(WRAPPING_METADATA_KEY) || this.getMetadata(LEGACY_KDF_METADATA_KEY)) {
       throw new Error("Vault is already initialized.");
     }
 
     const vaultKey = generateVaultKey();
-    const { key: masterKey, kdf: masterKdf } = createVaultKdf(masterPassword);
+    const { key: masterKey, kdf: masterKdf } = await createVaultKdf(masterPassword);
     const recoveryKeys = Array.from({ length: RECOVERY_KEY_COUNT }, () => generateRecoveryKey());
+    const recoverySlots: RecoverySlot[] = [];
+    for (const [index, recoveryKey] of recoveryKeys.entries()) {
+      recoverySlots.push(await this.createRecoverySlot(recoveryKey, vaultKey, index));
+    }
     const wrapping: VaultWrapping = {
       v: 2,
       master: {
         kdf: masterKdf,
-        wrappedKey: encryptJson(vaultKey.toString("base64"), masterKey)
+        wrappedKey: this.wrapVaultKey(vaultKey, masterKey)
       },
-      recovery: recoveryKeys.map((recoveryKey, index) => this.createRecoverySlot(recoveryKey, vaultKey, index))
+      recovery: recoverySlots
     };
+    zeroKey(masterKey);
 
     this.setMetadata(WRAPPING_METADATA_KEY, JSON.stringify(wrapping));
     this.key = vaultKey;
@@ -172,70 +231,74 @@ export class VaultDatabase {
     };
   }
 
-  unlock(masterPassword: string): VaultStatus {
+  async unlock(masterPassword: string): Promise<VaultStatus> {
     const wrapping = this.readWrapping();
     if (wrapping) {
-      const key = deriveKey(masterPassword, wrapping.master.kdf.salt, wrapping.master.kdf.iterations);
-
-      if (!verifyKey(key, wrapping.master.kdf.verifier)) {
-        throw new Error("Invalid master password.");
-      }
-
+      const key = await this.deriveAndVerify(masterPassword, wrapping.master.kdf, "Invalid master password.");
       this.key = this.unwrapVaultKey(wrapping.master.wrappedKey, key);
+      zeroKey(key);
       return this.status();
     }
 
     const kdf = this.readKdf();
-    const legacyKey = deriveKey(masterPassword, kdf.salt, kdf.iterations);
-
-    if (!verifyKey(legacyKey, kdf.verifier)) {
-      throw new Error("Invalid master password.");
-    }
-
-    this.key = legacyKey;
+    this.key = await this.deriveAndVerify(masterPassword, kdf, "Invalid master password.");
     return this.status();
   }
 
   lock(): VaultStatus {
+    zeroKey(this.key);
     this.key = null;
     return this.status();
   }
 
-  recoverWithRecoveryKey(recoveryKey: string, nextMasterPassword: string): VaultRecoveryResult {
+  close(): void {
+    this.lock();
+    this.db.pragma("wal_checkpoint(TRUNCATE)");
+    this.db.close();
+  }
+
+  async recoverWithRecoveryKey(recoveryKey: string, nextMasterPassword: string): Promise<VaultRecoveryResult> {
     const wrapping = this.readWrapping();
     if (!wrapping) {
       throw new Error("This vault does not have recovery keys. Unlock with the master password first.");
     }
 
     const normalizedRecoveryKey = normalizeRecoveryKey(recoveryKey);
-    const slotIndex = wrapping.recovery.findIndex((slot) => {
-      if (slot.usedAt || !slot.wrappedKey) return false;
-      const key = deriveKey(normalizedRecoveryKey, slot.kdf.salt, slot.kdf.iterations);
-      return verifyKey(key, slot.kdf.verifier);
-    });
+    let slotIndex = -1;
+    let recoveryDerivedKey: Buffer | null = null;
+    for (const [index, slot] of wrapping.recovery.entries()) {
+      if (slot.usedAt || !slot.wrappedKey) continue;
+      const key = await deriveKey(normalizedRecoveryKey, slot.kdf.salt, slot.kdf.iterations);
+      if (verifyKey(key, slot.kdf.verifier)) {
+        slotIndex = index;
+        recoveryDerivedKey = key;
+        break;
+      }
+      zeroKey(key);
+    }
 
-    if (slotIndex < 0) {
+    if (slotIndex < 0 || !recoveryDerivedKey) {
       throw new Error("Invalid or already used recovery key.");
     }
 
     const slot = wrapping.recovery[slotIndex];
-    const recoveryDerivedKey = deriveKey(normalizedRecoveryKey, slot.kdf.salt, slot.kdf.iterations);
     const vaultKey = this.unwrapVaultKey(slot.wrappedKey, recoveryDerivedKey);
-    const { key: nextMasterKey, kdf: nextMasterKdf } = createVaultKdf(nextMasterPassword);
+    zeroKey(recoveryDerivedKey);
+    const { key: nextMasterKey, kdf: nextMasterKdf } = await createVaultKdf(nextMasterPassword);
     const replacementRecoveryKey = generateRecoveryKey();
+    const replacementSlot = await this.createRecoverySlot(replacementRecoveryKey, vaultKey, slotIndex);
 
     const nextWrapping: VaultWrapping = {
       ...wrapping,
       master: {
         kdf: nextMasterKdf,
-        wrappedKey: encryptJson(vaultKey.toString("base64"), nextMasterKey)
+        wrappedKey: this.wrapVaultKey(vaultKey, nextMasterKey)
       },
       recovery: wrapping.recovery.map((currentSlot, index) =>
-        index === slotIndex
-          ? this.createRecoverySlot(replacementRecoveryKey, vaultKey, slotIndex)
-          : currentSlot
+        index === slotIndex ? replacementSlot : currentSlot
       )
     };
+    zeroKey(nextMasterKey);
 
     this.setMetadata(WRAPPING_METADATA_KEY, JSON.stringify(nextWrapping));
     this.key = vaultKey;
@@ -280,25 +343,20 @@ export class VaultDatabase {
     const id = randomUUID();
     const encryptedData = draft.encryptedData ? encryptJson(draft.encryptedData, key) : null;
 
-    this.db
-      .prepare(
-        `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @contentFormat, @url, @repoPath, @category, @tags, @encryptedData, @createdAt, @updatedAt)`
-      )
-      .run({
-        id,
-        type: draft.type,
-        title: draft.title.trim(),
-        content: serializeItemContent(draft),
-        contentFormat: draft.contentFormat ?? defaultContentFormat(draft.type),
-        url: draft.url || null,
-        repoPath: draft.repoPath || null,
-        category: draft.category?.trim() || "General",
-        tags: JSON.stringify(draft.tags ?? []),
-        encryptedData,
-        createdAt: now,
-        updatedAt: now
-      });
+    this.db.prepare(INSERT_ITEM_SQL).run({
+      id,
+      type: draft.type,
+      title: draft.title.trim(),
+      content: serializeItemContent(draft),
+      content_format: draft.contentFormat ?? defaultContentFormat(draft.type),
+      url: draft.url || null,
+      repo_path: draft.repoPath || null,
+      category: draft.category?.trim() || "General",
+      tags: JSON.stringify(draft.tags ?? []),
+      encrypted_data: encryptedData,
+      created_at: now,
+      updated_at: now
+    });
 
     if (draft.attachmentPaths?.length) {
       this.addAttachments(id, draft.attachmentPaths);
@@ -355,7 +413,7 @@ export class VaultDatabase {
     this.db.prepare("DELETE FROM items WHERE id = ?").run(id);
 
     for (const attachment of attachments) {
-      if (attachment.filePath.startsWith(this.attachmentRoot) && fs.existsSync(attachment.filePath)) {
+      if (this.isUnderAttachmentRoot(attachment.filePath) && fs.existsSync(attachment.filePath)) {
         fs.rmSync(attachment.filePath, { force: true });
       }
     }
@@ -366,16 +424,28 @@ export class VaultDatabase {
     this.getRow(itemId);
     const records = filePaths.map((filePath) => this.copyAttachment(itemId, filePath));
 
-    const insert = this.db.prepare(
-      `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
-       VALUES (@id, @itemId, @filePath, @kind, @originalName, @createdAt)`
-    );
+    const insert = this.db.prepare(INSERT_ATTACHMENT_SQL);
     const saveAll = this.db.transaction((items: AttachmentRecord[]) => {
       for (const item of items) {
-        insert.run(item);
+        insert.run({
+          id: item.id,
+          item_id: item.itemId,
+          file_path: item.filePath,
+          kind: item.kind,
+          original_name: item.originalName,
+          created_at: item.createdAt
+        });
       }
     });
-    saveAll(records);
+
+    try {
+      saveAll(records);
+    } catch (error) {
+      for (const record of records) {
+        fs.rmSync(record.filePath, { force: true });
+      }
+      throw error;
+    }
     return records;
   }
 
@@ -388,7 +458,7 @@ export class VaultDatabase {
   attachmentPreview(attachmentId: string): AttachmentPreview | null {
     this.requireKey();
     const row = this.db.prepare("SELECT * FROM attachments WHERE id = ?").get(attachmentId) as AttachmentRow | undefined;
-    if (!row || !fs.existsSync(row.file_path) || !isImage(row.original_name)) {
+    if (!row || !this.isUnderAttachmentRoot(row.file_path) || !fs.existsSync(row.file_path) || !isImage(row.original_name)) {
       return null;
     }
 
@@ -400,24 +470,26 @@ export class VaultDatabase {
     };
   }
 
-  changeMasterPassword(currentPassword: string, nextPassword: string): VaultStatus {
+  async changeMasterPassword(currentPassword: string, nextPassword: string): Promise<VaultStatus> {
     const wrapping = this.readWrapping();
     if (wrapping) {
-      const currentKey = deriveKey(currentPassword, wrapping.master.kdf.salt, wrapping.master.kdf.iterations);
-
-      if (!verifyKey(currentKey, wrapping.master.kdf.verifier)) {
-        throw new Error("Current master password is incorrect.");
-      }
+      const currentKey = await this.deriveAndVerify(
+        currentPassword,
+        wrapping.master.kdf,
+        "Current master password is incorrect."
+      );
 
       const vaultKey = this.unwrapVaultKey(wrapping.master.wrappedKey, currentKey);
-      const { key: nextKey, kdf: nextKdf } = createVaultKdf(nextPassword);
+      zeroKey(currentKey);
+      const { key: nextKey, kdf: nextKdf } = await createVaultKdf(nextPassword);
       const nextWrapping: VaultWrapping = {
         ...wrapping,
         master: {
           kdf: nextKdf,
-          wrappedKey: encryptJson(vaultKey.toString("base64"), nextKey)
+          wrappedKey: this.wrapVaultKey(vaultKey, nextKey)
         }
       };
+      zeroKey(nextKey);
 
       this.setMetadata(WRAPPING_METADATA_KEY, JSON.stringify(nextWrapping));
       this.key = vaultKey;
@@ -425,13 +497,9 @@ export class VaultDatabase {
     }
 
     const currentKdf = this.readKdf();
-    const currentKey = deriveKey(currentPassword, currentKdf.salt, currentKdf.iterations);
+    const currentKey = await this.deriveAndVerify(currentPassword, currentKdf, "Current master password is incorrect.");
 
-    if (!verifyKey(currentKey, currentKdf.verifier)) {
-      throw new Error("Current master password is incorrect.");
-    }
-
-    const { key: nextKey, kdf: nextKdf } = createVaultKdf(nextPassword);
+    const { key: nextKey, kdf: nextKdf } = await createVaultKdf(nextPassword);
     const rows = this.db.prepare("SELECT id, encrypted_data FROM items").all() as Array<{
       id: string;
       encrypted_data: string | null;
@@ -448,11 +516,12 @@ export class VaultDatabase {
     });
 
     reencrypt();
+    zeroKey(currentKey);
     this.key = nextKey;
     return this.status();
   }
 
-  exportBackup(backupPassword: string): BackupExportResult {
+  async exportBackup(backupPassword: string): Promise<BackupExportResult> {
     this.requireKey();
     const metadata = this.db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>;
     const items = this.db.prepare("SELECT * FROM items ORDER BY created_at ASC").all() as ItemRow[];
@@ -472,40 +541,36 @@ export class VaultDatabase {
       attachments,
       files
     };
-    const { key, kdf } = createVaultKdf(backupPassword);
+    const { key, kdf } = await createVaultKdf(backupPassword);
     const backup = JSON.stringify({
       cachetteBackup: 1,
       kdf,
       payload: encryptJson(payload, key)
     });
+    zeroKey(key);
     const filePath = path.join(app.getPath("downloads"), `cachette-backup-${Date.now()}.enc`);
 
     fs.writeFileSync(filePath, backup, { mode: 0o600 });
     return { filePath };
   }
 
-  importBackup(request: BackupImportRequest): BackupImportResult {
-    const raw = JSON.parse(fs.readFileSync(request.backupPath, "utf8")) as {
-      cachetteBackup: 1;
-      kdf: VaultKdf;
-      payload: string;
-    };
-    const backupKey = deriveKey(request.backupPassword, raw.kdf.salt, raw.kdf.iterations);
+  async importBackup(request: BackupImportRequest): Promise<BackupImportResult> {
+    const raw = backupEnvelopeSchema.parse(JSON.parse(fs.readFileSync(request.backupPath, "utf8")));
+    const backupKey = await this.deriveAndVerify(request.backupPassword, raw.kdf, "Invalid backup password.");
 
-    if (!verifyKey(backupKey, raw.kdf.verifier)) {
-      throw new Error("Invalid backup password.");
-    }
-
-    const payload = decryptJson<BackupPayload>(raw.payload, backupKey);
-    if (!payload || payload.version !== 1) {
+    const decrypted = decryptJson<unknown>(raw.payload, backupKey);
+    zeroKey(backupKey);
+    const parsedPayload = backupPayloadSchema.safeParse(decrypted);
+    if (!parsedPayload.success) {
       throw new Error("Unsupported backup format.");
     }
+    const payload: BackupPayload = parsedPayload.data;
 
     if (request.mode === "merge") {
-      this.mergeBackup(payload, request.sourceMasterPassword);
+      await this.mergeBackup(payload, request.sourceMasterPassword);
     } else {
       this.replaceBackup(payload);
-      this.key = null;
+      this.lock();
     }
 
     return {
@@ -525,6 +590,7 @@ export class VaultDatabase {
     clearAll();
     fs.rmSync(this.attachmentRoot, { force: true, recursive: true });
     fs.mkdirSync(this.attachmentRoot, { recursive: true });
+    zeroKey(this.key);
     this.key = null;
     return this.status();
   }
@@ -547,7 +613,8 @@ export class VaultDatabase {
 
     this.db.pragma("foreign_keys = OFF");
     try {
-      this.db.exec(`
+      const migrate = this.db.transaction(() => {
+        this.db.exec(`
         DROP TABLE IF EXISTS items_next;
 
         CREATE TABLE items_next (
@@ -575,6 +642,8 @@ export class VaultDatabase {
         CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);
         CREATE INDEX IF NOT EXISTS idx_items_updated_at ON items(updated_at);
       `);
+      });
+      migrate();
     } finally {
       this.db.pragma("foreign_keys = ON");
     }
@@ -633,7 +702,7 @@ export class VaultDatabase {
 
   private copyAttachment(itemId: string, sourcePath: string): AttachmentRecord {
     if (!fs.existsSync(sourcePath)) {
-      throw new Error(`Attachment does not exist: ${sourcePath}`);
+      throw new Error(`Attachment does not exist: ${path.basename(sourcePath)}`);
     }
 
     const id = randomUUID();
@@ -654,41 +723,47 @@ export class VaultDatabase {
   }
 
   private replaceBackup(payload: BackupPayload): void {
+    const fileDataByPath = new Map(payload.files.map((file) => [file.filePath, file.data]));
+    const filesToWrite: Array<{ filePath: string; data: string }> = [];
+
+    // Never trust file paths baked into a backup: recompute every attachment
+    // location under this vault's attachment root.
+    const nextAttachments = payload.attachments.map((attachment) => {
+      const originalName = path.basename(attachment.original_name || attachment.file_path);
+      const filePath = this.resolveUnderAttachmentRoot(
+        path.join(this.attachmentRoot, sanitizePathSegment(attachment.item_id), `${sanitizePathSegment(attachment.id)}-${originalName}`)
+      );
+      const data = fileDataByPath.get(attachment.file_path);
+      if (data) {
+        filesToWrite.push({ filePath, data });
+      }
+      return { ...attachment, file_path: filePath, original_name: originalName };
+    });
+
     const replaceAll = this.db.transaction(() => {
       this.db.prepare("DELETE FROM attachments").run();
       this.db.prepare("DELETE FROM items").run();
       this.db.prepare("DELETE FROM metadata").run();
 
       const insertMeta = this.db.prepare("INSERT INTO metadata (key, value) VALUES (@key, @value)");
-      const insertItem = this.db.prepare(
-        `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @content_format, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
-      );
-      const insertAttachment = this.db.prepare(
-        `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
-         VALUES (@id, @item_id, @file_path, @kind, @original_name, @created_at)`
-      );
+      const insertItem = this.db.prepare(INSERT_ITEM_SQL);
+      const insertAttachment = this.db.prepare(INSERT_ATTACHMENT_SQL);
 
       for (const row of payload.metadata) insertMeta.run(row);
       for (const row of payload.items) insertItem.run(this.normalizeBackupItemRow(row));
-      for (const row of payload.attachments) insertAttachment.run(row);
+      for (const row of nextAttachments) insertAttachment.run(row);
     });
 
-    replaceAll();
-
-    for (const file of payload.files) {
-      fs.mkdirSync(path.dirname(file.filePath), { recursive: true });
-      fs.writeFileSync(file.filePath, Buffer.from(file.data, "base64"), { mode: 0o600 });
-    }
+    this.writeAttachmentFiles(filesToWrite, replaceAll);
   }
 
-  private mergeBackup(payload: BackupPayload, sourceMasterPassword: string | undefined): void {
+  private async mergeBackup(payload: BackupPayload, sourceMasterPassword: string | undefined): Promise<void> {
     const currentKey = this.requireKey();
     if (!sourceMasterPassword) {
       throw new Error("Source vault master password is required for merge imports.");
     }
 
-    const sourceKey = this.backupVaultKey(payload, sourceMasterPassword);
+    const sourceKey = await this.backupVaultKey(payload, sourceMasterPassword);
 
     const now = new Date().toISOString();
     const itemIdMap = new Map<string, string>();
@@ -737,58 +812,93 @@ export class VaultDatabase {
     });
 
     const mergeAll = this.db.transaction(() => {
-      const insertItem = this.db.prepare(
-        `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
-         VALUES (@id, @type, @title, @content, @content_format, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`
-      );
-      const insertAttachment = this.db.prepare(
-        `INSERT INTO attachments (id, item_id, file_path, kind, original_name, created_at)
-         VALUES (@id, @item_id, @file_path, @kind, @original_name, @created_at)`
-      );
+      const insertItem = this.db.prepare(INSERT_ITEM_SQL);
+      const insertAttachment = this.db.prepare(INSERT_ATTACHMENT_SQL);
 
       for (const row of nextItems) insertItem.run(row);
       for (const row of nextAttachments) insertAttachment.run(row);
     });
 
-    mergeAll();
+    zeroKey(sourceKey);
+    this.writeAttachmentFiles(filesToWrite, mergeAll);
+  }
 
-    for (const file of filesToWrite) {
-      fs.mkdirSync(path.dirname(file.filePath), { recursive: true });
-      fs.writeFileSync(file.filePath, Buffer.from(file.data, "base64"), { mode: 0o600 });
+  private writeAttachmentFiles(files: Array<{ filePath: string; data: string }>, commit: () => void): void {
+    const written: string[] = [];
+    try {
+      for (const file of files) {
+        const filePath = this.resolveUnderAttachmentRoot(file.filePath);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, Buffer.from(file.data, "base64"), { mode: 0o600 });
+        written.push(filePath);
+      }
+      commit();
+    } catch (error) {
+      for (const filePath of written) {
+        fs.rmSync(filePath, { force: true });
+      }
+      throw error;
     }
   }
 
-  private backupVaultKey(payload: BackupPayload, sourceMasterPassword: string): Buffer {
+  private isUnderAttachmentRoot(candidate: string): boolean {
+    const resolved = path.resolve(candidate);
+    const root = path.resolve(this.attachmentRoot);
+    return resolved === root || resolved.startsWith(root + path.sep);
+  }
+
+  private resolveUnderAttachmentRoot(candidate: string): string {
+    if (!this.isUnderAttachmentRoot(candidate)) {
+      throw new Error("Attachment path is outside the vault attachment folder.");
+    }
+    return path.resolve(candidate);
+  }
+
+  private async backupVaultKey(payload: BackupPayload, sourceMasterPassword: string): Promise<Buffer> {
     const wrapping = this.backupWrapping(payload);
     if (wrapping) {
-      const sourceMasterKey = deriveKey(sourceMasterPassword, wrapping.master.kdf.salt, wrapping.master.kdf.iterations);
-      if (!verifyKey(sourceMasterKey, wrapping.master.kdf.verifier)) {
-        throw new Error("Source vault master password is incorrect.");
-      }
-      return this.unwrapVaultKey(wrapping.master.wrappedKey, sourceMasterKey);
+      const sourceMasterKey = await this.deriveAndVerify(
+        sourceMasterPassword,
+        wrapping.master.kdf,
+        "Source vault master password is incorrect."
+      );
+      const vaultKey = this.unwrapVaultKey(wrapping.master.wrappedKey, sourceMasterKey);
+      zeroKey(sourceMasterKey);
+      return vaultKey;
     }
 
     const metadata = payload.metadata.find((row) => row.key === LEGACY_KDF_METADATA_KEY);
     if (!metadata) {
       throw new Error("Backup is missing vault key metadata.");
     }
-    const sourceKdf = JSON.parse(metadata.value) as VaultKdf;
-    const sourceKey = deriveKey(sourceMasterPassword, sourceKdf.salt, sourceKdf.iterations);
-    if (!verifyKey(sourceKey, sourceKdf.verifier)) {
-      throw new Error("Source vault master password is incorrect.");
-    }
-    return sourceKey;
+    const sourceKdf = vaultKdfSchema.parse(JSON.parse(metadata.value));
+    return this.deriveAndVerify(sourceMasterPassword, sourceKdf, "Source vault master password is incorrect.");
   }
 
-  private createRecoverySlot(recoveryKey: string, vaultKey: Buffer, index: number): RecoverySlot {
+  private async deriveAndVerify(password: string, kdf: VaultKdf, errorMessage: string): Promise<Buffer> {
+    const key = await deriveKey(password, kdf.salt, kdf.iterations);
+    if (!verifyKey(key, kdf.verifier)) {
+      zeroKey(key);
+      throw new Error(errorMessage);
+    }
+    return key;
+  }
+
+  private wrapVaultKey(vaultKey: Buffer, key: Buffer): string {
+    return encryptJson(vaultKey.toString("base64"), key);
+  }
+
+  private async createRecoverySlot(recoveryKey: string, vaultKey: Buffer, index: number): Promise<RecoverySlot> {
     const normalizedRecoveryKey = normalizeRecoveryKey(recoveryKey);
-    const { key, kdf } = createVaultKdf(normalizedRecoveryKey);
+    const { key, kdf } = await createVaultKdf(normalizedRecoveryKey);
+    const wrappedKey = this.wrapVaultKey(vaultKey, key);
+    zeroKey(key);
 
     return {
       id: randomUUID(),
       label: `Recovery key ${index + 1}`,
       kdf,
-      wrappedKey: encryptJson(vaultKey.toString("base64"), key)
+      wrappedKey
     };
   }
 
@@ -842,6 +952,10 @@ export class VaultDatabase {
 
 function isImage(fileName: string): boolean {
   return /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(fileName);
+}
+
+function sanitizePathSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, "_") || "_";
 }
 
 function imageMimeType(fileName: string): string {

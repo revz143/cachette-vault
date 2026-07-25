@@ -53,6 +53,16 @@ import { MarkdownPreview } from "./MarkdownPreview";
 import { NoteContentField } from "./NoteContentField";
 import { PlainTextContent, RichTextPreview } from "./RichText";
 import { createTodoId, TodoListEditor } from "./TodoListEditor";
+import { useClipboard } from "@/hooks/useClipboard";
+import { useSecret } from "@/hooks/useSecret";
+import {
+  deriveRepoTitle,
+  extractDroppedFiles,
+  getErrorMessage,
+  normalizeTagName,
+  parseTags,
+  validateConfirmedPassword
+} from "@/lib/utils";
 
 type Theme = "dark" | "light";
 type SettingsPanel = "password" | "export" | "import" | null;
@@ -174,15 +184,28 @@ export function VaultApp() {
     [category, search, tag, type]
   );
 
+  // Sequence counter drops responses that resolve after a newer load started,
+  // so fast typing in search can't leave a stale list on screen.
+  const loadSeq = useRef(0);
+  const filtersRef = useRef(filters);
+  useEffect(() => {
+    filtersRef.current = filters;
+  }, [filters]);
+
   const refresh = useCallback(
-    async (nextFilters = filters) => {
+    async (nextFilters?: ItemFilters) => {
       if (!api) return;
-      const [nextAllItems, nextItems] = await Promise.all([api.listItems(), api.listItems(nextFilters)]);
+      const seq = ++loadSeq.current;
+      const effectiveFilters = nextFilters ?? filtersRef.current;
+      const [nextAllItems, nextItems] = await Promise.all([api.listItems(), api.listItems(effectiveFilters)]);
+      if (seq !== loadSeq.current) return;
       setAllItems(nextAllItems);
       setItems(nextItems);
-      setSelectedId((current) => current ?? nextItems[0]?.id ?? null);
+      setSelectedId((current) =>
+        current && nextItems.some((item) => item.id === current) ? current : nextItems[0]?.id ?? null
+      );
     },
-    [api, filters]
+    [api]
   );
 
   useEffect(() => {
@@ -231,12 +254,7 @@ export function VaultApp() {
       if (!hasFiles(event)) return;
       event.preventDefault();
       setDragOver(false);
-      const picked = Array.from(event.dataTransfer?.files ?? [])
-        .map((file) => {
-          const fileWithPath = file as File & { path?: string };
-          return fileWithPath.path ? { path: fileWithPath.path, name: file.name } : undefined;
-        })
-        .filter(Boolean) as Array<{ path: string; name: string }>;
+      const picked = extractDroppedFiles(event.dataTransfer?.files);
 
       if (!picked.length) {
         setToast("Drop files from your desktop into the Electron app.");
@@ -278,18 +296,8 @@ export function VaultApp() {
       return;
     }
 
-    api
-      .listItems()
-      .then((nextAllItems) => {
-        setAllItems(nextAllItems);
-        return api.listItems(filters);
-      })
-      .then((nextItems) => {
-        setItems(nextItems);
-        setSelectedId((current) => current ?? nextItems[0]?.id ?? null);
-      })
-      .catch((error) => showError(error, setToast));
-  }, [api, filters, status?.unlocked]);
+    refresh(filters).catch((error) => showError(error, setToast));
+  }, [api, filters, refresh, status?.unlocked]);
 
   const categories = useMemo(() => {
     const names = new Set([...customProjects, ...allItems.map((item) => item.category)]);
@@ -335,7 +343,7 @@ export function VaultApp() {
   }
 
   function addCustomTag(name: string) {
-    name = name.trim().replace(/^#/, "").toLowerCase();
+    name = normalizeTagName(name);
     if (!name) return;
     setCustomTags((current) => Array.from(new Set([...current, name])).sort());
     setTag(name);
@@ -604,7 +612,7 @@ function AppFrame({
         onToast?.("Window controls are available in the desktop app.");
       }
     } catch (error) {
-      onToast?.(error instanceof Error ? error.message : "Window action failed.");
+      onToast?.(getErrorMessage(error, "Window action failed."));
     }
   }
 
@@ -684,7 +692,7 @@ function TagManagerModal({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const name = newTag.trim().replace(/^#/, "").toLowerCase();
+    const name = normalizeTagName(newTag);
     if (!name) return;
     onCreate(name);
     setNewTag("");
@@ -784,12 +792,12 @@ function DetailPane({
   onChanged: () => Promise<void>;
   onToast: (message: string) => void;
 }) {
-  const [secret, setSecret] = useState<Record<string, string> | null>(null);
+  const { secret, load: loadSecret, clear: clearSecret } = useSecret(api, item?.id);
   const [revealed, setRevealed] = useState(false);
   const [previews, setPreviews] = useState<Record<string, AttachmentPreview>>({});
+  const copy = useClipboard(api, onToast);
 
   useEffect(() => {
-    setSecret(null);
     setRevealed(false);
     setPreviews({});
   }, [item?.id]);
@@ -836,56 +844,59 @@ function DetailPane({
     if (!item) return;
     if (revealed) {
       setRevealed(false);
+      clearSecret();
       return;
     }
 
-    const nextSecret = await api.revealSecret(item.id);
-    setSecret(nextSecret);
-    setRevealed(true);
+    try {
+      await loadSecret();
+      setRevealed(true);
+    } catch (error) {
+      onToast(getErrorMessage(error, "Could not reveal encrypted fields."));
+    }
   }
 
   async function remove() {
     if (!item || !window.confirm(`Delete "${item.title}"?`)) return;
-    await api.deleteItem(item.id);
-    await onChanged();
+    try {
+      await api.deleteItem(item.id);
+      await onChanged();
+    } catch (error) {
+      onToast(getErrorMessage(error, "Could not delete this item."));
+    }
   }
 
   async function openPrimaryTarget() {
     if (!item) return;
     if (item.url) {
-      await api.openExternal(item.url);
-      return;
-    }
-    if (item.repoPath?.startsWith("http")) {
-      await api.openExternal(item.repoPath);
+      await openTarget(item.url);
       return;
     }
     if (item.repoPath) {
-      await api.openPath(item.repoPath);
+      await openTarget(item.repoPath);
     }
   }
 
   async function openTarget(target: string) {
-    if (/^https?:\/\//i.test(target)) {
-      await api.openExternal(target);
-      return;
+    try {
+      if (/^https?:\/\//i.test(target)) {
+        await api.openExternal(target);
+        return;
+      }
+      await api.openPath(target);
+    } catch (error) {
+      onToast(getErrorMessage(error, "Could not open this target."));
     }
-    await api.openPath(target);
   }
 
-  async function copyText(text: string, message = "Copied") {
-    try {
-      await api.copyText(text);
-    } catch {
-      await navigator.clipboard?.writeText(text);
-    }
-    onToast(message);
+  function copyText(text: string, message = "Copied") {
+    void copy(text, { message });
   }
 
   async function toggleTodo(todoId: string, done: boolean) {
     if (!item?.todos) return;
     const todos = item.todos.map((todo) => (todo.id === todoId ? { ...todo, done } : todo));
-    await api.updateItem({ id: item.id, todos, contentFormat: "plain" });
+    await api.updateItem({ id: item.id, todos });
     await onChanged();
   }
 
@@ -1038,7 +1049,7 @@ function DetailPane({
                 <Copy size={14} />
                 Copy
               </button>
-              <button className="mini-button" type="button" onClick={() => api.openPath(attachment.filePath)}>
+              <button className="mini-button" type="button" onClick={() => void openTarget(attachment.filePath)}>
                 <ExternalLink size={14} />
                 Open
               </button>
@@ -1077,43 +1088,26 @@ function TodoDetail({ todos, onToggle }: { todos: TodoEntry[]; onToggle: (todoId
 }
 
 function PasswordDetail({ api, item, onToast }: { api: CachetteApi; item: VaultItem; onToast: (message: string) => void }) {
-  const [secret, setSecret] = useState<Record<string, string>>({});
+  const { secret, load: loadSecret } = useSecret(api, item.id);
   const [visible, setVisible] = useState(false);
+  const copy = useClipboard(api, onToast);
 
   useEffect(() => {
-    let cancelled = false;
-    api
-      .revealSecret(item.id)
-      .then((nextSecret) => {
-        if (!cancelled) setSecret(nextSecret);
-      })
-      .catch((error) => onToast(error instanceof Error ? error.message : "Could not load password."));
-    return () => {
-      cancelled = true;
-    };
-  }, [api, item.id, onToast]);
+    loadSecret().catch((error) => onToast(getErrorMessage(error, "Could not load password.")));
+  }, [loadSecret, onToast]);
 
-  async function copySecret(value: string, label: string) {
-    if (!value) return;
-    try {
-      await api.copyText(value);
-      window.setTimeout(() => {
-        void api.copyText("");
-      }, 15_000);
-      onToast(`${label} copied`);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Could not copy secret.");
-    }
+  function copySecret(value: string, label: string) {
+    void copy(value, { message: `${label} copied`, clearAfterMs: 15_000 });
   }
 
-  async function openWebsite() {
+  function openWebsite() {
     if (!item.url) return;
-    await api.openExternal(item.url);
+    api.openExternal(item.url).catch((error) => onToast(getErrorMessage(error, "Could not open website.")));
   }
 
-  const username = secret.username ?? "";
-  const password = secret.password ?? "";
-  const notes = secret.notes || item.content;
+  const username = secret?.username ?? "";
+  const password = secret?.password ?? "";
+  const notes = secret?.notes || item.content;
 
   return (
     <div className="password-detail">
@@ -1202,7 +1196,7 @@ function EditItemModal({
         setPassword(secret.password ?? "");
         setSecretNotes(secret.notes ?? "");
       })
-      .catch((revealError) => setError(revealError instanceof Error ? revealError.message : "Could not load encrypted fields."));
+      .catch((revealError) => setError(getErrorMessage(revealError, "Could not load encrypted fields.")));
     return () => {
       cancelled = true;
     };
@@ -1211,10 +1205,7 @@ function EditItemModal({
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
-    const tags = tagsText
-      .split(",")
-      .map((tag) => tag.trim().replace(/^#/, "").toLowerCase())
-      .filter(Boolean);
+    const tags = parseTags(tagsText);
     const nextTitle = title.trim() || (item.type === "repo" ? deriveRepoTitle(repoPath || url) : "");
 
     if (!nextTitle) {
@@ -1242,7 +1233,7 @@ function EditItemModal({
     try {
       await onSave(update);
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Could not update this item.");
+      setError(getErrorMessage(saveError, "Could not update this item."));
     } finally {
       setSaving(false);
     }
@@ -1402,10 +1393,11 @@ function SetupScreen({ api, onStatus }: { api: CachetteApi; onStatus: (status: V
   const [runAtStartup, setRunAtStartup] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const copy = useClipboard(api);
 
   const strength = password.length >= 18 ? 4 : password.length >= 14 ? 3 : password.length >= 10 ? 2 : password.length >= 8 ? 1 : 0;
   const mismatch = confirm && password !== confirm;
-  const passwordBad = password.length < 8 || password !== confirm;
+  const passwordBad = Boolean(validateConfirmedPassword(password, confirm));
 
   async function next() {
     setError("");
@@ -1413,8 +1405,9 @@ function SetupScreen({ api, onStatus }: { api: CachetteApi; onStatus: (status: V
       setStep(1);
       return;
     }
-    if (passwordBad) {
-      setError(password.length < 8 ? "Use at least 8 characters." : "Passwords do not match.");
+    const validationError = validateConfirmedPassword(password, confirm);
+    if (validationError) {
+      setError(validationError);
       return;
     }
     setBusy(true);
@@ -1424,7 +1417,7 @@ function SetupScreen({ api, onStatus }: { api: CachetteApi; onStatus: (status: V
       setRecoveryKeys(result.recoveryKeys);
       setStep(2);
     } catch (setupError) {
-      setError(setupError instanceof Error ? setupError.message : "Could not create vault.");
+      setError(getErrorMessage(setupError, "Could not create vault."));
     } finally {
       setBusy(false);
     }
@@ -1437,16 +1430,18 @@ function SetupScreen({ api, onStatus }: { api: CachetteApi; onStatus: (status: V
       await api.setRunAtStartup(runAtStartup);
       onStatus(setupStatus ?? (await api.vaultStatus()));
     } catch (setupError) {
-      setError(setupError instanceof Error ? setupError.message : "Could not create vault.");
+      setError(getErrorMessage(setupError, "Could not create vault."));
     }
   }
 
-  async function copyRecoveryKey(value: string) {
-    await api.copyText(value);
+  function copyRecoveryKey(value: string) {
+    void copy(value, { clearAfterMs: 30_000 });
   }
 
-  async function copyAllRecoveryKeys() {
-    await api.copyText(recoveryKeys.map((key, index) => `Recovery key ${index + 1}: ${key}`).join("\n"));
+  function copyAllRecoveryKeys() {
+    void copy(recoveryKeys.map((key, index) => `Recovery key ${index + 1}: ${key}`).join("\n"), {
+      clearAfterMs: 30_000
+    });
   }
 
   return (
@@ -1711,12 +1706,6 @@ function SettingsModal({
   function togglePanel(nextPanel: SettingsPanel) {
     if (busy) return;
     setPanel((current) => (current === nextPanel ? null : nextPanel));
-  }
-
-  function validateConfirmedPassword(password: string, confirmation: string): string {
-    if (password.length < 8) return "Use at least 8 characters.";
-    if (password !== confirmation) return "Passwords do not match.";
-    return "";
   }
 
   async function changePassword(event: FormEvent<HTMLFormElement>) {
@@ -2098,17 +2087,6 @@ function strengthLabel(strength: number) {
   return ["Too short", "Starter strength", "Getting stronger", "Strong", "Very strong"][strength];
 }
 
-function deriveRepoTitle(value: string) {
-  const trimmed = value.trim().replace(/[\\\/]+$/, "");
-  if (!trimmed) return "";
-  try {
-    const url = new URL(trimmed);
-    return url.pathname.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? url.hostname;
-  } catch {
-    return trimmed.split(/[\\\/]/).filter(Boolean).pop() ?? trimmed;
-  }
-}
-
 function extractLegacyRepoRemote(content: string) {
   return content.match(/^Remote:\s*(\S+)/i)?.[1];
 }
@@ -2222,6 +2200,7 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
   const [replacementRecoveryKey, setReplacementRecoveryKey] = useState("");
   const [recoveredStatus, setRecoveredStatus] = useState<VaultStatus | null>(null);
   const [error, setError] = useState("");
+  const copy = useClipboard(api);
 
   async function unlock(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -2229,7 +2208,7 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
     try {
       onStatus(await api.unlockVault(password));
     } catch (unlockError) {
-      setError(unlockError instanceof Error ? unlockError.message : "Could not unlock vault.");
+      setError(getErrorMessage(unlockError, "Could not unlock vault."));
     }
   }
 
@@ -2237,12 +2216,9 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
     event.preventDefault();
     setError("");
 
-    if (nextPassword.length < 8) {
-      setError("Use at least 8 characters for the new master password.");
-      return;
-    }
-    if (nextPassword !== confirmPassword) {
-      setError("New master passwords do not match.");
+    const validationError = validateConfirmedPassword(nextPassword, confirmPassword);
+    if (validationError) {
+      setError(validationError);
       return;
     }
 
@@ -2254,7 +2230,7 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
       setNextPassword("");
       setConfirmPassword("");
     } catch (recoverError) {
-      setError(recoverError instanceof Error ? recoverError.message : "Could not recover vault.");
+      setError(getErrorMessage(recoverError, "Could not recover vault."));
     }
   }
 
@@ -2324,7 +2300,7 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
           <div className="recovery-key-row single">
             <span>New key</span>
             <code>{replacementRecoveryKey}</code>
-            <button className="icon-button" type="button" onClick={() => void api.copyText(replacementRecoveryKey)} aria-label="Copy replacement recovery key">
+            <button className="icon-button" type="button" onClick={() => void copy(replacementRecoveryKey, { clearAfterMs: 30_000 })} aria-label="Copy replacement recovery key">
               <Copy size={15} />
             </button>
           </div>
@@ -2405,7 +2381,7 @@ function MascotMark({ className }: { className?: string }) {
 }
 
 function showError(error: unknown, setMessage: (message: string) => void) {
-  setMessage(error instanceof Error ? error.message : "Something went wrong.");
+  setMessage(getErrorMessage(error));
 }
 
 function createBrowserFallbackApi(): CachetteApi {
@@ -2476,8 +2452,13 @@ function createBrowserFallbackApi(): CachetteApi {
       return item;
     },
     updateItem: async (update) => {
-      items = items.map((item) => (item.id === update.id ? { ...item, ...update, updatedAt: new Date().toISOString() } : item));
-      return items.find((item) => item.id === update.id)!;
+      const existing = items.find((item) => item.id === update.id);
+      if (!existing) {
+        throw new Error("Item not found.");
+      }
+      const next = { ...existing, ...update, updatedAt: new Date().toISOString() };
+      items = items.map((item) => (item.id === update.id ? next : item));
+      return next;
     },
     deleteItem: async (id) => {
       items = items.filter((item) => item.id !== id);

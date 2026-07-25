@@ -1,4 +1,7 @@
-import { createCipheriv, createDecipheriv, createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, pbkdf2, randomBytes, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+
+const pbkdf2Async = promisify(pbkdf2);
 
 const KDF_ITERATIONS = 600_000;
 const KEY_LENGTH = 32;
@@ -38,9 +41,9 @@ export function normalizeRecoveryKey(value: string): string {
   return value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-export function createVaultKdf(masterPassword: string): { key: Buffer; kdf: VaultKdf } {
+export async function createVaultKdf(masterPassword: string): Promise<{ key: Buffer; kdf: VaultKdf }> {
   const salt = randomBytes(32);
-  const key = deriveKey(masterPassword, salt.toString("base64"), KDF_ITERATIONS);
+  const key = await deriveKey(masterPassword, salt.toString("base64"), KDF_ITERATIONS);
 
   return {
     key,
@@ -53,8 +56,12 @@ export function createVaultKdf(masterPassword: string): { key: Buffer; kdf: Vaul
   };
 }
 
-export function deriveKey(masterPassword: string, saltBase64: string, iterations = KDF_ITERATIONS): Buffer {
-  return pbkdf2Sync(masterPassword, Buffer.from(saltBase64, "base64"), iterations, KEY_LENGTH, DIGEST);
+export function deriveKey(masterPassword: string, saltBase64: string, iterations = KDF_ITERATIONS): Promise<Buffer> {
+  return pbkdf2Async(masterPassword, Buffer.from(saltBase64, "base64"), iterations, KEY_LENGTH, DIGEST);
+}
+
+export function zeroKey(key: Buffer | null | undefined): void {
+  key?.fill(0);
 }
 
 export function verifyKey(key: Buffer, verifier: string): boolean {

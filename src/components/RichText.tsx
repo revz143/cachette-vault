@@ -1,5 +1,6 @@
 "use client";
 
+import DOMPurify from "dompurify";
 import { Bold, Eraser, Italic, Link2, List, ListOrdered, Underline } from "lucide-react";
 import { useEffect, useRef } from "react";
 
@@ -108,7 +109,16 @@ export function sanitizeRichTextHtml(html: string) {
     return "";
   }
 
-  const documentNode = new DOMParser().parseFromString(html, "text/html");
+  // DOMPurify provides the vetted security pass; the walker below then
+  // normalizes markup (b -> strong, div -> p, unwrap span) and re-validates
+  // link schemes.
+  const purified = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ["a", "b", "br", "div", "em", "i", "li", "ol", "p", "span", "strong", "u", "ul"],
+    ALLOWED_ATTR: ["href"],
+    ALLOWED_URI_REGEXP: /^(?:https?:|mailto:)/i
+  });
+
+  const documentNode = new DOMParser().parseFromString(purified, "text/html");
   return Array.from(documentNode.body.childNodes).map(sanitizeNode).join("");
 }
 

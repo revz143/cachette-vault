@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { VaultDatabase } from "./db";
-import type { BackupImportRequest, ItemDraft, ItemFilters, ItemUpdate, VaultSettings } from "../shared/types";
+import type { VaultSettings } from "../shared/types";
 
 const SERVICE_NAME = "Cachette Vault";
 const APP_ICON_PATH = path.join(app.getAppPath(), "assets", "icon.ico");
@@ -31,7 +31,7 @@ const todoEntrySchema = z.object({
 const itemDraftSchema = z.object({
   type: itemTypeSchema,
   title: z.string().min(1).max(180),
-  content: z.string().optional(),
+  content: z.string().max(1_000_000).optional(),
   contentFormat: contentFormatSchema.optional(),
   todos: z.array(todoEntrySchema).optional(),
   url: z.string().optional(),
@@ -41,9 +41,16 @@ const itemDraftSchema = z.object({
   encryptedData: z.record(z.string()).optional(),
   attachmentPaths: z.array(z.string()).optional()
 });
-const itemUpdateSchema = itemDraftSchema.partial().extend({
+const itemUpdateSchema = itemDraftSchema.omit({ attachmentPaths: true }).partial().extend({
   id: z.string().min(1)
 });
+
+// File types Windows will execute when opened via the shell; item data can be
+// seeded by imported backups, so never launch these from the vault.
+const BLOCKED_OPEN_EXTENSIONS = new Set([
+  ".exe", ".bat", ".cmd", ".com", ".scr", ".ps1", ".psm1", ".vbs", ".vbe",
+  ".js", ".jse", ".wsf", ".wsh", ".msi", ".msp", ".lnk", ".hta", ".pif", ".reg", ".jar"
+]);
 const filtersSchema = z
   .object({
     search: z.string().optional(),
@@ -74,7 +81,7 @@ app.on("window-all-closed", () => undefined);
 app.on("before-quit", () => {
   isQuitting = true;
   globalShortcut.unregisterAll();
-  vault?.lock();
+  vault?.close();
 });
 
 app.whenReady().then(async () => {
@@ -109,7 +116,16 @@ async function createWindow(): Promise<void> {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
+    }
+  });
+
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+    const allowed = rendererUrl ? url.startsWith(rendererUrl) : url.startsWith("file://");
+    if (!allowed) {
+      event.preventDefault();
     }
   });
 
@@ -222,59 +238,42 @@ function registerTrayShortcut(shortcut: string): boolean {
 }
 
 function registerIpc(): void {
-  ipcMain.handle("vault:status", async () => vault.status());
+  handle("vault:status", () => vault.status());
 
-  ipcMain.handle("vault:setup", async (_event, masterPassword: string) => {
-    requirePassword(masterPassword);
-    return vault.setup(masterPassword);
-  });
+  handle("vault:setup", (_event, masterPassword) => vault.setup(requirePassword(masterPassword)));
 
-  ipcMain.handle("vault:unlock", async (_event, masterPassword: string) => {
-    requirePassword(masterPassword);
-    return vault.unlock(masterPassword);
-  });
+  handle("vault:unlock", (_event, masterPassword) => vault.unlock(requirePassword(masterPassword)));
 
-  ipcMain.handle("vault:recover", async (_event, recoveryKey: string, nextMasterPassword: string) => {
-    if (!recoveryKey || recoveryKey.trim().length < 10) {
+  handle("vault:recover", (_event, recoveryKey, nextMasterPassword) => {
+    const parsedRecoveryKey = z.string().parse(recoveryKey);
+    if (parsedRecoveryKey.trim().length < 10) {
       throw new Error("Recovery key is required.");
     }
-    requirePassword(nextMasterPassword);
-    return vault.recoverWithRecoveryKey(recoveryKey, nextMasterPassword);
+    return vault.recoverWithRecoveryKey(parsedRecoveryKey, requirePassword(nextMasterPassword));
   });
 
-  ipcMain.handle("vault:lock", async () => vault.lock());
+  handle("vault:lock", () => vault.lock());
 
-  ipcMain.handle("items:list", async (_event, filters?: ItemFilters) => {
-    return vault.listItems(filtersSchema.parse(filters));
-  });
+  handle("items:list", (_event, filters) => vault.listItems(filtersSchema.parse(filters)));
 
-  ipcMain.handle("items:create", async (_event, draft: ItemDraft) => {
-    return vault.createItem(itemDraftSchema.parse(draft));
-  });
+  handle("items:create", (_event, draft) => vault.createItem(itemDraftSchema.parse(draft)));
 
-  ipcMain.handle("items:update", async (_event, update: ItemUpdate) => {
-    return vault.updateItem(itemUpdateSchema.parse(update));
-  });
+  handle("items:update", (_event, update) => vault.updateItem(itemUpdateSchema.parse(update)));
 
-  ipcMain.handle("items:delete", async (_event, id: string) => {
+  handle("items:delete", (_event, id) => {
     vault.deleteItem(z.string().min(1).parse(id));
   });
 
-  ipcMain.handle("items:reveal-secret", async (_event, id: string) => {
-    return vault.revealSecret(z.string().min(1).parse(id));
-  });
+  handle("items:reveal-secret", (_event, id) => vault.revealSecret(z.string().min(1).parse(id)));
 
-  ipcMain.handle("attachments:pick", async () => {
-    const openDialogOptions: Electron.OpenDialogOptions = {
+  handle("attachments:pick", async () => {
+    const result = await showOpenDialog({
       properties: ["openFile", "multiSelections"],
       filters: [
         { name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"] },
         { name: "All files", extensions: ["*"] }
       ]
-    };
-    const result = mainWindow
-      ? await dialog.showOpenDialog(mainWindow, openDialogOptions)
-      : await dialog.showOpenDialog(openDialogOptions);
+    });
 
     return result.filePaths.map((filePath) => ({
       path: filePath,
@@ -282,53 +281,44 @@ function registerIpc(): void {
     }));
   });
 
-  ipcMain.handle("attachments:add", async (_event, itemId: string, filePaths: string[]) => {
+  handle("attachments:add", (_event, itemId, filePaths) => {
     return vault.addAttachments(z.string().min(1).parse(itemId), z.array(z.string()).parse(filePaths));
   });
 
-  ipcMain.handle("attachments:preview", async (_event, attachmentId: string) => {
+  handle("attachments:preview", (_event, attachmentId) => {
     return vault.attachmentPreview(z.string().min(1).parse(attachmentId));
   });
 
-  ipcMain.handle("backup:export", async (_event, backupPassword: string) => {
-    requirePassword(backupPassword);
-    return vault.exportBackup(backupPassword);
-  });
+  handle("backup:export", (_event, backupPassword) => vault.exportBackup(requirePassword(backupPassword)));
 
-  ipcMain.handle("backup:pick", async () => {
-    const openDialogOptions: Electron.OpenDialogOptions = {
+  handle("backup:pick", async () => {
+    const result = await showOpenDialog({
       properties: ["openFile"],
       filters: [
         { name: "Cachette backups", extensions: ["enc"] },
         { name: "All files", extensions: ["*"] }
       ]
-    };
-    const result = mainWindow
-      ? await dialog.showOpenDialog(mainWindow, openDialogOptions)
-      : await dialog.showOpenDialog(openDialogOptions);
+    });
     const backupPath = result.filePaths[0];
 
     return backupPath ? { path: backupPath, name: path.basename(backupPath) } : null;
   });
 
-  ipcMain.handle("backup:import", async (_event, request: BackupImportRequest) => {
-    const parsed = backupImportSchema.parse(request);
-    return vault.importBackup(parsed);
-  });
+  handle("backup:import", (_event, request) => vault.importBackup(backupImportSchema.parse(request)));
 
-  ipcMain.handle("settings:status", async () => settingsStatus());
+  handle("settings:status", () => settingsStatus());
 
-  ipcMain.handle("settings:desktop-shortcut", async (_event, enabled: boolean) => {
+  handle("settings:desktop-shortcut", (_event, enabled) => {
     setDesktopShortcut(z.boolean().parse(enabled));
     return settingsStatus();
   });
 
-  ipcMain.handle("settings:run-at-startup", async (_event, enabled: boolean) => {
+  handle("settings:run-at-startup", (_event, enabled) => {
     setRunAtStartup(z.boolean().parse(enabled));
     return settingsStatus();
   });
 
-  ipcMain.handle("settings:tray-shortcut", async (_event, shortcut: string) => {
+  handle("settings:tray-shortcut", (_event, shortcut) => {
     const parsed = z.string().max(80).parse(shortcut).trim();
     const previousSettings = readAppSettings();
     const previousShortcut = previousSettings.trayShortcut;
@@ -340,28 +330,33 @@ function registerIpc(): void {
     return settingsStatus();
   });
 
-  ipcMain.handle("settings:change-password", async (_event, currentPassword: string, nextPassword: string) => {
-    requirePassword(currentPassword);
-    requirePassword(nextPassword);
-    return vault.changeMasterPassword(currentPassword, nextPassword);
+  handle("settings:change-password", (_event, currentPassword, nextPassword) => {
+    return vault.changeMasterPassword(requirePassword(currentPassword), requirePassword(nextPassword));
   });
 
-  ipcMain.handle("dev:reset-onboarding", async () => {
+  handle("dev:reset-onboarding", () => {
     if (!isDevelopmentMode()) {
       throw new Error("Onboarding reset is only available in development mode.");
     }
     return vault.resetForDevelopment();
   });
 
-  ipcMain.handle("shell:open-path", async (_event, targetPath: string) => {
+  handle("shell:open-path", async (_event, targetPath) => {
     const parsed = z.string().min(1).parse(targetPath);
+    const stats = fs.statSync(parsed, { throwIfNoEntry: false });
+    if (!stats) {
+      throw new Error("That path no longer exists.");
+    }
+    if (!stats.isDirectory() && BLOCKED_OPEN_EXTENSIONS.has(path.extname(parsed).toLowerCase())) {
+      throw new Error("Opening executable files from the vault is not allowed.");
+    }
     const error = await shell.openPath(parsed);
     if (error) {
       throw new Error(error);
     }
   });
 
-  ipcMain.handle("shell:open-external", async (_event, url: string) => {
+  handle("shell:open-external", async (_event, url) => {
     const parsed = z.string().url().parse(url);
     const protocol = new URL(parsed).protocol;
     if (!["https:", "http:"].includes(protocol)) {
@@ -370,18 +365,18 @@ function registerIpc(): void {
     await shell.openExternal(parsed);
   });
 
-  ipcMain.handle("clipboard:write-text", async (_event, text: string) => {
+  handle("clipboard:write-text", (_event, text) => {
     clipboard.writeText(z.string().parse(text));
   });
 
-  ipcMain.handle("window:minimize", async (event) => {
-    const targetWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  handle("window:minimize", (event) => {
+    const targetWindow = windowFor(event);
     targetWindow?.minimize();
     return Boolean(targetWindow);
   });
 
-  ipcMain.handle("window:toggle-maximize", async (event) => {
-    const targetWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  handle("window:toggle-maximize", (event) => {
+    const targetWindow = windowFor(event);
     if (!targetWindow) {
       return false;
     }
@@ -393,17 +388,50 @@ function registerIpc(): void {
     return true;
   });
 
-  ipcMain.handle("window:close", async (event) => {
-    const targetWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  handle("window:close", (event) => {
+    const targetWindow = windowFor(event);
     targetWindow?.close();
     return Boolean(targetWindow);
   });
 }
 
-function requirePassword(value: string): void {
-  if (!value || value.length < 8) {
+function handle(
+  channel: string,
+  handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => unknown
+): void {
+  ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+    try {
+      return await handler(event, ...args);
+    } catch (error) {
+      console.error(`[ipc:${channel}]`, error);
+      throw new Error(publicErrorMessage(error));
+    }
+  });
+}
+
+function publicErrorMessage(error: unknown): string {
+  if (error instanceof z.ZodError) {
+    return "Invalid request payload.";
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return "Operation failed.";
+}
+
+function windowFor(event: Electron.IpcMainInvokeEvent): BrowserWindow | null {
+  return BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+}
+
+async function showOpenDialog(options: Electron.OpenDialogOptions): Promise<Electron.OpenDialogReturnValue> {
+  return mainWindow ? dialog.showOpenDialog(mainWindow, options) : dialog.showOpenDialog(options);
+}
+
+function requirePassword(value: unknown): string {
+  if (typeof value !== "string" || value.length < 8) {
     throw new Error("Password must be at least 8 characters.");
   }
+  return value;
 }
 
 async function settingsStatus(): Promise<VaultSettings> {

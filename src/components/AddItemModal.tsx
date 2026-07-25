@@ -6,6 +6,7 @@ import { useMemo, useState } from "react";
 import type { CachetteApi, ItemContentFormat, ItemDraft, ItemType, PickedFile, TodoEntry } from "@/shared/types";
 import { NoteContentField } from "./NoteContentField";
 import { createTodoId, TodoListEditor } from "./TodoListEditor";
+import { deriveRepoTitle, extractDroppedFiles, getErrorMessage, parseTags } from "@/lib/utils";
 
 type QuickAddType = Exclude<ItemType, "private">;
 
@@ -46,10 +47,7 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
   const [saving, setSaving] = useState(false);
 
   const selectedType = useMemo(() => TYPES.find((item) => item.type === type), [type]);
-  const tags = tagsText
-    .split(",")
-    .map((tag) => tag.trim().toLowerCase())
-    .filter(Boolean);
+  const tags = parseTags(tagsText);
 
   function pickType(nextType: QuickAddType) {
     setType(nextType);
@@ -117,25 +115,24 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
       await onSave(draft);
       onClose();
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Could not save this item.");
+      setError(getErrorMessage(saveError, "Could not save this item."));
     } finally {
       setSaving(false);
     }
   }
 
   async function pickFiles() {
-    const picked = await api.pickAttachments();
-    setAttachments((current) => mergePickedFiles(current, picked));
+    try {
+      const picked = await api.pickAttachments();
+      setAttachments((current) => mergePickedFiles(current, picked));
+    } catch (pickError) {
+      setError(getErrorMessage(pickError, "Could not pick files."));
+    }
   }
 
   function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
-    const picked = Array.from(event.dataTransfer.files)
-      .map((file) => {
-        const fileWithPath = file as File & { path?: string };
-        return fileWithPath.path ? { path: fileWithPath.path, name: file.name } : undefined;
-      })
-      .filter(Boolean) as PickedFile[];
+    const picked = extractDroppedFiles(event.dataTransfer.files);
 
     if (!picked.length) {
       setError("Drag files from your desktop into the Electron app, or use Browse.");
@@ -293,17 +290,6 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
       </form>
     </div>
   );
-}
-
-function deriveRepoTitle(value: string) {
-  const trimmed = value.trim().replace(/[\\\/]+$/, "");
-  if (!trimmed) return "";
-  try {
-    const url = new URL(trimmed);
-    return url.pathname.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? url.hostname;
-  } catch {
-    return trimmed.split(/[\\\/]/).filter(Boolean).pop() ?? trimmed;
-  }
 }
 
 function titlePlaceholder(type: QuickAddType) {

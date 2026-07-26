@@ -11,7 +11,7 @@ Cachette Vault is a local-first desktop vault for passwords, notes, todos, links
 
 ## Download
 
-[![Download Installer](https://img.shields.io/badge/%E2%AC%87%20DOWNLOAD%20INSTALLER-WINDOWS%20X64-f4b400?style=for-the-badge&labelColor=4a4a4a&color=f4b400)](https://github.com/revz143/cachette-vault/releases/latest/download/Cachette-Vault-Setup-0.1.0.exe)
+[![Download Installer](https://img.shields.io/badge/%E2%AC%87%20DOWNLOAD%20INSTALLER-WINDOWS%20X64-f4b400?style=for-the-badge&labelColor=4a4a4a&color=f4b400)](https://github.com/revz143/cachette-vault/releases/latest/download/Cachette-Vault-Setup-0.1.2.exe)
 
 ## Features
 
@@ -66,7 +66,7 @@ npm run dist
 The Windows installer is written to:
 
 ```txt
-release/Cachette-Vault-Setup-0.1.0.exe
+release/Cachette-Vault-Setup-0.1.2.exe
 ```
 
 ## Project Structure

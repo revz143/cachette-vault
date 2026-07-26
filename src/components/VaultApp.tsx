@@ -14,6 +14,7 @@ import {
   Folder,
   FolderGit2,
   FolderPlus,
+  House,
   KeyRound,
   Link2,
   Lock,
@@ -66,6 +67,7 @@ import {
 
 type Theme = "dark" | "light";
 type SettingsPanel = "password" | "export" | "import" | null;
+type WorkspaceView = "home" | "vault";
 
 const TYPE_META: Record<ItemType, { label: string; icon: ComponentType<{ size?: number }>; color: string }> = {
   note: { label: "Note", icon: NotebookPen, color: "var(--tnote)" },
@@ -78,6 +80,7 @@ const TYPE_META: Record<ItemType, { label: string; icon: ComponentType<{ size?: 
 };
 
 const TAG_COLORS = ["#f3bf4f", "#f286a8", "#4fd1c5", "#7aa7ff", "#b48cf2", "#4ade80"];
+const ITEM_TYPE_ORDER: ItemType[] = ["note", "link", "repo", "todo", "image", "password", "private"];
 
 export function VaultApp() {
   const [api, setApi] = useState<CachetteApi | null>(null);
@@ -89,9 +92,11 @@ export function VaultApp() {
   const [type, setType] = useState<ItemType | "all">("all");
   const [category, setCategory] = useState("All");
   const [tag, setTag] = useState<string | undefined>();
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("home");
   const [theme, setTheme] = useState<Theme>("dark");
   const [modalOpen, setModalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsPanel, setSettingsPanel] = useState<SettingsPanel>(null);
   const [tagsOpen, setTagsOpen] = useState(false);
   const [projectCreatorOpen, setProjectCreatorOpen] = useState(false);
   const [projectDraft, setProjectDraft] = useState("");
@@ -110,6 +115,7 @@ export function VaultApp() {
     setAllItems([]);
     setItems([]);
     setSelectedId(null);
+    setWorkspaceView("home");
   }, [api]);
 
   useEffect(() => {
@@ -174,6 +180,13 @@ export function VaultApp() {
     };
   }, [autoLockMs, lockVault, status?.unlocked]);
 
+  useEffect(() => {
+    if (status?.unlocked) {
+      setWorkspaceView("home");
+      setSelectedId(null);
+    }
+  }, [status?.unlocked]);
+
   const filters: ItemFilters = useMemo(
     () => ({
       search,
@@ -202,7 +215,7 @@ export function VaultApp() {
       setAllItems(nextAllItems);
       setItems(nextItems);
       setSelectedId((current) =>
-        current && nextItems.some((item) => item.id === current) ? current : nextItems[0]?.id ?? null
+        current && nextItems.some((item) => item.id === current) ? current : null
       );
     },
     [api]
@@ -224,6 +237,7 @@ export function VaultApp() {
       if (event.key === "Escape") {
         setModalOpen(false);
         setSettingsOpen(false);
+        setSettingsPanel(null);
         setTagsOpen(false);
         setEditingItem(null);
       }
@@ -272,6 +286,7 @@ export function VaultApp() {
           attachmentPaths: picked.map((file) => file.path)
         });
         await refresh();
+        setWorkspaceView("vault");
         setType("image");
         setSelectedId(created.id);
         setToast(picked.length === 1 ? "Image added to vault" : `${picked.length} images added to vault`);
@@ -306,12 +321,46 @@ export function VaultApp() {
 
   const sidebarCategories = useMemo(() => ["All", ...categories], [categories]);
   const tags = useMemo(() => Array.from(new Set([...customTags, ...allItems.flatMap((item) => item.tags)])).sort(), [allItems, customTags]);
-  const selected = items.find((item) => item.id === selectedId) ?? items[0];
+  const selected = selectedId ? items.find((item) => item.id === selectedId) : undefined;
+
+  function openSettings(panel: SettingsPanel = null) {
+    setSettingsPanel(panel);
+    setSettingsOpen(true);
+  }
+
+  function showHome() {
+    setWorkspaceView("home");
+    setCategory("All");
+    setTag(undefined);
+    setSearch("");
+    setType("all");
+    setSelectedId(null);
+  }
+
+  function showCategory(name: string) {
+    setWorkspaceView("vault");
+    setCategory(name);
+    setTag(undefined);
+    setSelectedId(null);
+  }
+
+  function showTag(name: string) {
+    setWorkspaceView("vault");
+    setTag(name === tag ? undefined : name);
+    setCategory("All");
+    setSelectedId(null);
+  }
+
+  function showItem(id: string) {
+    setWorkspaceView("vault");
+    setSelectedId(id);
+  }
 
   async function handleSave(draft: ItemDraft) {
     if (!api) return;
     const created = await api.createItem(draft);
     await refresh();
+    setWorkspaceView("vault");
     setSelectedId(created.id);
     flash("Saved to vault");
   }
@@ -329,6 +378,7 @@ export function VaultApp() {
     name = name.trim();
     if (!name) return;
     setCustomProjects((current) => Array.from(new Set([...current, name])).sort());
+    setWorkspaceView("vault");
     setCategory(name);
     setTag(undefined);
     setSelectedId(null);
@@ -346,6 +396,7 @@ export function VaultApp() {
     name = normalizeTagName(name);
     if (!name) return;
     setCustomTags((current) => Array.from(new Set([...current, name])).sort());
+    setWorkspaceView("vault");
     setTag(name);
     setCategory("All");
   }
@@ -379,7 +430,7 @@ export function VaultApp() {
       api={api}
       lockLeft={lockLeft}
       onLock={lockVault}
-      onSettings={() => setSettingsOpen(true)}
+      onSettings={() => openSettings()}
       onTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
       onToast={flash}
       theme={theme}
@@ -387,6 +438,17 @@ export function VaultApp() {
     >
       <section className="vault-layout">
         <aside className="sidebar">
+          <nav className="nav-section home-nav" aria-label="Home">
+            <button
+              className={workspaceView === "home" ? "nav-row is-active" : "nav-row"}
+              onClick={showHome}
+              type="button"
+            >
+              <House size={15} />
+              <span>Home</span>
+            </button>
+          </nav>
+
           <nav className="nav-section" aria-label="Categories">
             <div className="nav-section-head">
               <span className="eyebrow">Projects</span>
@@ -412,12 +474,8 @@ export function VaultApp() {
               return (
                 <button
                   key={name}
-                  className={name === category ? "nav-row is-active" : "nav-row"}
-                  onClick={() => {
-                    setCategory(name);
-                    setTag(undefined);
-                    setSelectedId(null);
-                  }}
+                  className={workspaceView === "vault" && name === category && !tag ? "nav-row is-active" : "nav-row"}
+                  onClick={() => showCategory(name)}
                 >
                   <ProjectIcon size={15} />
                   <span>{projectLabel}</span>
@@ -438,11 +496,8 @@ export function VaultApp() {
             {tags.map((name) => (
               <button
                 key={name}
-                className={name === tag ? "nav-row tag-row is-active" : "nav-row tag-row"}
-                onClick={() => {
-                  setTag(name === tag ? undefined : name);
-                  setSelectedId(null);
-                }}
+                className={workspaceView === "vault" && name === tag ? "nav-row tag-row is-active" : "nav-row tag-row"}
+                onClick={() => showTag(name)}
               >
                 <span className="tag-dot" style={{ background: tagColor(name) }} />
                 <span>{name}</span>
@@ -460,48 +515,67 @@ export function VaultApp() {
             </div>
         </aside>
 
-        <section className="list-pane">
-          <div className="list-tools">
-            <div className="search-row">
-              <Search size={17} />
-              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search titles, tags, content..." />
-            </div>
-            <button className="primary-button new-button" onClick={() => setModalOpen(true)} title="Quick add">
-              <Plus size={15} />
-              New
-            </button>
-          </div>
+        {workspaceView === "home" ? (
+          <VaultHomeDashboard
+            allItems={allItems}
+            category={category}
+            categories={categories}
+            items={allItems}
+            onAdd={() => setModalOpen(true)}
+            onImport={() => openSettings("import")}
+            onLock={lockVault}
+            onSelectCategory={showCategory}
+            onSelectItem={showItem}
+            onSelectTag={showTag}
+            tag={tag}
+            tags={tags}
+          />
+        ) : (
+          <>
+            <section className="list-pane">
+              <div className="list-tools">
+                <div className="search-row">
+                  <Search size={17} />
+                  <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search titles, tags, content..." />
+                </div>
+                <button className="primary-button new-button" onClick={() => setModalOpen(true)} title="Quick add">
+                  <Plus size={15} />
+                  New
+                </button>
+              </div>
 
-          <div className="type-tabs">
-            {(["all", "note", "link", "repo", "todo", "image", "password", "private"] as Array<ItemType | "all">).map((value) => (
-              <button key={value} className={value === type ? "chip is-active" : "chip"} onClick={() => setType(value)}>
-                {value === "all" ? "All" : TYPE_META[value].label}
-              </button>
-            ))}
-          </div>
+              <div className="type-tabs">
+                {(["all", "note", "link", "repo", "todo", "image", "password", "private"] as Array<ItemType | "all">).map((value) => (
+                  <button key={value} className={value === type ? "chip is-active" : "chip"} onClick={() => setType(value)}>
+                    {value === "all" ? "All" : TYPE_META[value].label}
+                  </button>
+                ))}
+              </div>
 
-          <div className="list-heading">
-            <strong>{items.length} items - {tag ? `#${tag}` : category === "All" ? "All items" : category}</strong>
-          </div>
+              <div className="list-heading">
+                <strong>{items.length} items - {tag ? `#${tag}` : category === "All" ? "All items" : category}</strong>
+              </div>
 
-          <div className="item-list">
-            {items.length === 0 && <EmptyList onAdd={() => setModalOpen(true)} />}
-            {items.map((item) => (
-              <ItemRow key={item.id} item={item} active={item.id === selected?.id} onClick={() => setSelectedId(item.id)} />
-            ))}
-          </div>
-        </section>
+              <div className="item-list">
+                {items.length === 0 && <EmptyList onAdd={() => setModalOpen(true)} />}
+                {items.map((item) => (
+                  <ItemRow key={item.id} item={item} active={item.id === selected?.id} onClick={() => showItem(item.id)} />
+                ))}
+              </div>
+            </section>
 
-        <DetailPane
-          api={api}
-          item={selected}
-          onEdit={setEditingItem}
-          onChanged={async () => {
-            await refresh();
-            flash("Vault updated");
-          }}
-          onToast={flash}
-        />
+            <DetailPane
+              api={api}
+              item={selected}
+              onEdit={setEditingItem}
+              onChanged={async () => {
+                await refresh();
+                flash("Vault updated");
+              }}
+              onToast={flash}
+            />
+          </>
+        )}
       </section>
 
       {modalOpen && <AddItemModal api={api} categories={categories} onClose={() => setModalOpen(false)} onSave={handleSave} />}
@@ -518,8 +592,12 @@ export function VaultApp() {
         <SettingsModal
           api={api}
           autoLockMs={autoLockMs}
+          initialPanel={settingsPanel}
           onAutoLockMs={setAutoLockMs}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsPanel(null);
+          }}
           onImported={async (nextStatus) => {
             setStatus(nextStatus);
             setSelectedId(null);
@@ -529,6 +607,7 @@ export function VaultApp() {
               setAllItems([]);
               setItems([]);
               setSettingsOpen(false);
+              setSettingsPanel(null);
             }
           }}
           onStatus={setStatus}
@@ -832,8 +911,8 @@ function DetailPane({
     return (
       <section className="detail-pane centered">
         <Shield size={34} />
-        <h2>No item selected</h2>
-        <p className="empty-copy">Add a note, link, repo, todo, image, or password to start filling the vault.</p>
+        <h2>Select an item</h2>
+        <p className="empty-copy">Choose something from the list to inspect or edit it.</p>
       </section>
     );
   }
@@ -1058,6 +1137,205 @@ function DetailPane({
         </div>
       )}
 
+    </section>
+  );
+}
+
+function VaultHomeDashboard({
+  allItems,
+  category,
+  categories,
+  items,
+  onAdd,
+  onImport,
+  onLock,
+  onSelectCategory,
+  onSelectItem,
+  onSelectTag,
+  tag,
+  tags
+}: {
+  allItems: VaultItem[];
+  category: string;
+  categories: string[];
+  items: VaultItem[];
+  onAdd: () => void;
+  onImport: () => void;
+  onLock: () => void | Promise<void>;
+  onSelectCategory: (name: string) => void;
+  onSelectItem: (id: string) => void;
+  onSelectTag: (name: string) => void;
+  tag?: string;
+  tags: string[];
+}) {
+  const recentItems = [...allItems]
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    .slice(0, 5);
+  const sensitiveCount = allItems.filter(isSensitiveItem).length;
+  const filteredLabel = tag ? `#${tag}` : category === "All" ? "all items" : category;
+  const projectShortcuts = categories.slice(0, 6);
+  const tagShortcuts = tags.slice(0, 8);
+
+  return (
+    <section className="detail-pane vault-home" aria-label="Vault home">
+      <div className="home-hero">
+        <div className="home-mascot-badge" aria-hidden="true">
+          <MascotMark className="home-mascot" />
+        </div>
+        <div className="home-hero-copy">
+          <span className="eyebrow">Vault home</span>
+          <h1>Vault Home</h1>
+          <p>{allItems.length} items sealed locally. Showing {items.length} from {filteredLabel}.</p>
+          <div className="home-actions">
+            <button className="primary-button" type="button" onClick={onAdd}>
+              <Plus size={15} />
+              New item
+            </button>
+            <button className="secondary-button" type="button" onClick={onImport}>
+              <Upload size={15} />
+              Import backup
+            </button>
+            <button className="secondary-button" type="button" onClick={() => void onLock()}>
+              <Lock size={15} />
+              Lock vault
+            </button>
+          </div>
+        </div>
+        <div className="home-hero-stats" aria-label="Vault quick stats">
+          <div>
+            <span>Total</span>
+            <strong>{allItems.length}</strong>
+          </div>
+          <div>
+            <span>Sensitive</span>
+            <strong>{sensitiveCount}</strong>
+          </div>
+        </div>
+      </div>
+
+      <div className="home-metrics" aria-label="Vault summary">
+        <div>
+          <span>Total items</span>
+          <strong>{allItems.length}</strong>
+        </div>
+        <div>
+          <span>Current view</span>
+          <strong>{items.length}</strong>
+        </div>
+        <div>
+          <span>Sensitive</span>
+          <strong>{sensitiveCount}</strong>
+        </div>
+      </div>
+
+      <div className="home-grid">
+        <section className="home-section home-section-wide">
+          <div className="home-section-head">
+            <span className="eyebrow">Recent</span>
+            <button className="mini-button" type="button" onClick={onAdd}>
+              <Plus size={14} />
+              Add
+            </button>
+          </div>
+          <div className="home-recent-list">
+            {recentItems.length === 0 && (
+              <div className="home-empty-state">
+                <Shield size={24} />
+                <strong>Nothing sealed yet</strong>
+                <span>Add your first note, link, repo, todo, image, or password.</span>
+              </div>
+            )}
+            {recentItems.map((recentItem) => {
+              const Icon = TYPE_META[recentItem.type].icon;
+              return (
+                <button className="home-recent-item" key={recentItem.id} type="button" onClick={() => onSelectItem(recentItem.id)}>
+                  <span className="type-dot" style={{ color: TYPE_META[recentItem.type].color }}>
+                    <Icon size={16} />
+                  </span>
+                  <span>
+                    <strong>{recentItem.title}</strong>
+                    <small>{TYPE_META[recentItem.type].label} - {recentItem.category} - {formatRelativeTime(recentItem.updatedAt)}</small>
+                  </span>
+                  {isSensitiveItem(recentItem) && <Lock size={13} />}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="home-section">
+          <div className="home-section-head">
+            <span className="eyebrow">Types</span>
+          </div>
+          <div className="home-type-grid">
+            {ITEM_TYPE_ORDER.map((itemType) => {
+              const Icon = TYPE_META[itemType].icon;
+              const count = allItems.filter((item) => item.type === itemType).length;
+              return (
+                <div className="home-type-tile" key={itemType} style={{ color: TYPE_META[itemType].color }}>
+                  <Icon size={16} />
+                  <span>{TYPE_META[itemType].label}</span>
+                  <strong>{count}</strong>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="home-section">
+          <div className="home-section-head">
+            <span className="eyebrow">Security</span>
+          </div>
+          <div className="home-status-list">
+            <div><Shield size={15} /><span>AES-256-GCM</span><strong>On disk</strong></div>
+            <div><KeyRound size={15} /><span>PBKDF2</span><strong>600k</strong></div>
+            <div><Lock size={15} /><span>Vault key</span><strong>Wrapped</strong></div>
+          </div>
+        </section>
+
+        <section className="home-section">
+          <div className="home-section-head">
+            <span className="eyebrow">Projects</span>
+          </div>
+          <div className="home-shortcuts">
+            <button className={category === "All" && !tag ? "is-active" : ""} type="button" onClick={() => onSelectCategory("All")}>
+              All items
+            </button>
+            {projectShortcuts.map((name) => (
+              <button key={name} className={category === name && !tag ? "is-active" : ""} type="button" onClick={() => onSelectCategory(name)}>
+                {name}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="home-section">
+          <div className="home-section-head">
+            <span className="eyebrow">Tags</span>
+          </div>
+          <div className="home-shortcuts">
+            {tagShortcuts.length === 0 && <span className="home-muted">No tags yet</span>}
+            {tagShortcuts.map((name) => (
+              <button key={name} className={tag === name ? "is-active" : ""} type="button" onClick={() => onSelectTag(name)}>
+                <span className="tag-dot" style={{ background: tagColor(name) }} />
+                {name}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="home-section home-backup-note">
+          <div>
+            <span className="eyebrow">Backup</span>
+            <strong>Encrypted exports stay portable.</strong>
+            <p>Create or import a sealed `.enc` backup whenever this vault needs to move machines.</p>
+          </div>
+          <button className="mini-button" type="button" onClick={onImport}>
+            <Download size={14} />
+            Open
+          </button>
+        </section>
+      </div>
     </section>
   );
 }
@@ -1597,6 +1875,7 @@ function FeatureLine({ icon, title, text }: { icon: ReactNode; title: string; te
 function SettingsModal({
   api,
   autoLockMs,
+  initialPanel,
   onAutoLockMs,
   onClose,
   onImported,
@@ -1608,6 +1887,7 @@ function SettingsModal({
 }: {
   api: CachetteApi;
   autoLockMs: number;
+  initialPanel?: SettingsPanel;
   onAutoLockMs: (value: number) => void;
   onClose: () => void;
   onImported: (status: VaultStatus) => Promise<void>;
@@ -1625,7 +1905,7 @@ function SettingsModal({
     developmentMode: false
   });
   const [busy, setBusy] = useState("");
-  const [panel, setPanel] = useState<SettingsPanel>(null);
+  const [panel, setPanel] = useState<SettingsPanel>(initialPanel ?? null);
   const [currentPassword, setCurrentPassword] = useState("");
   const [nextPassword, setNextPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -2097,6 +2377,10 @@ function stripLegacyRepoRemote(content: string) {
 
 function uniqueStrings(values: Array<string | undefined>) {
   return Array.from(new Set(values.map((value) => value?.trim()).filter(Boolean))) as string[];
+}
+
+function isSensitiveItem(item: VaultItem) {
+  return item.type === "password" || item.type === "private" || Boolean(item.encryptedData);
 }
 
 function shortcutFromKeyboardEvent(event: ReactKeyboardEvent<HTMLInputElement>) {

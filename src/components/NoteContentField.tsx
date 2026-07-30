@@ -2,7 +2,7 @@
 
 import type { ItemContentFormat } from "@/shared/types";
 import { MarkdownPreview } from "./MarkdownPreview";
-import { RichTextEditor, RichTextPreview } from "./RichText";
+import { RichTextEditor } from "./RichText";
 
 type NoteContentFieldProps = {
   value: string;
@@ -73,12 +73,7 @@ export function NoteContentField({
         </>
       )}
       {contentFormat === "richtext" && (
-        <>
-          <RichTextEditor value={value} onChange={onChange} rows={rows} />
-          <div className="markdown-preview-box rich-preview-box">
-            <RichTextPreview html={value} />
-          </div>
-        </>
+        <RichTextEditor value={value} onChange={onChange} rows={rows} />
       )}
     </div>
   );

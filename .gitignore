@@ -6,3 +6,5 @@ release/
 *.local
 *.log
 cachette-dev/
+tsconfig.tsbuildinfo
+.claude/

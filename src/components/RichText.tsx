@@ -40,7 +40,7 @@ export function RichTextEditor({ value, onChange, rows = 7 }: RichTextEditorProp
 
   function normalizeEditorHtml() {
     const sanitized = sanitizeRichTextHtml(editorRef.current?.innerHTML ?? "");
-    if (editorRef.current) {
+    if (editorRef.current && editorRef.current.innerHTML !== sanitized) {
       editorRef.current.innerHTML = sanitized;
     }
     onChange(sanitized);
@@ -48,7 +48,11 @@ export function RichTextEditor({ value, onChange, rows = 7 }: RichTextEditorProp
 
   return (
     <div className="rich-text-field">
-      <div className="rich-text-toolbar" aria-label="Rich text tools">
+      <div
+        className="rich-text-toolbar"
+        aria-label="Rich text tools"
+        onMouseDown={(event) => event.preventDefault()}
+      >
         <button type="button" onClick={() => runCommand("bold")} title="Bold" aria-label="Bold">
           <Bold size={14} />
         </button>

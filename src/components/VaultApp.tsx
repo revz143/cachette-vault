@@ -44,6 +44,7 @@ import type {
   ItemType,
   ItemUpdate,
   PickedFile,
+  RememberStatus,
   TodoEntry,
   VaultItem,
   VaultSettings,
@@ -107,16 +108,22 @@ export function VaultApp() {
   const [lockLeft, setLockLeft] = useState<number | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [toast, setToast] = useState("");
+  const [remember, setRemember] = useState<RememberStatus>({ available: false, enabled: false });
 
-  const lockVault = useCallback(async () => {
+  const lockVault = useCallback(async (options?: { forget?: boolean }) => {
     if (!api) return;
-    const nextStatus = await api.lockVault();
+    const nextStatus = await api.lockVault(options);
     setStatus(nextStatus);
     setAllItems([]);
     setItems([]);
     setSelectedId(null);
     setWorkspaceView("home");
+    api.rememberStatus().then(setRemember).catch(() => undefined);
   }, [api]);
+
+  // Purposeful locks (button, shortcut) drop the remembered session; the idle
+  // timer locks without forgetting so "Resume session" stays available.
+  const lockAndForget = useCallback(() => lockVault({ forget: true }), [lockVault]);
 
   useEffect(() => {
     const cachette = window.cachette ?? createBrowserFallbackApi();
@@ -131,7 +138,20 @@ export function VaultApp() {
     }
     setCustomProjects(readStoredList("cachette:projects"));
     setCustomTags(readStoredList("cachette:tags"));
-    cachette.vaultStatus().then(setStatus).catch((error) => showError(error, setToast));
+    cachette
+      .vaultStatus()
+      .then(async (bootStatus) => {
+        if (bootStatus.initialized && !bootStatus.unlocked) {
+          try {
+            bootStatus = await cachette.autoUnlock();
+          } catch {
+            // Fall back to the lock screen; the remembered session may be gone.
+          }
+        }
+        setStatus(bootStatus);
+        cachette.rememberStatus().then(setRemember).catch(() => undefined);
+      })
+      .catch((error) => showError(error, setToast));
   }, []);
 
   useEffect(() => {
@@ -232,7 +252,7 @@ export function VaultApp() {
       }
       if (event.ctrlKey && event.key.toLowerCase() === "l") {
         event.preventDefault();
-        void lockVault();
+        void lockAndForget();
       }
       if (event.key === "Escape") {
         setModalOpen(false);
@@ -245,7 +265,7 @@ export function VaultApp() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [lockVault, status?.unlocked]);
+  }, [lockAndForget, status?.unlocked]);
 
   useEffect(() => {
     if (!api || !status?.unlocked) {
@@ -420,7 +440,7 @@ export function VaultApp() {
   if (!status.unlocked) {
     return (
       <AppFrame api={api}>
-        <UnlockScreen api={api} onStatus={setStatus} status={status} />
+        <UnlockScreen api={api} onStatus={setStatus} status={status} remember={remember} onRememberChange={setRemember} />
       </AppFrame>
     );
   }
@@ -429,7 +449,7 @@ export function VaultApp() {
     <AppFrame
       api={api}
       lockLeft={lockLeft}
-      onLock={lockVault}
+      onLock={lockAndForget}
       onSettings={() => openSettings()}
       onTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
       onToast={flash}
@@ -523,7 +543,7 @@ export function VaultApp() {
             items={allItems}
             onAdd={() => setModalOpen(true)}
             onImport={() => openSettings("import")}
-            onLock={lockVault}
+            onLock={lockAndForget}
             onSelectCategory={showCategory}
             onSelectItem={showItem}
             onSelectTag={showTag}
@@ -611,6 +631,8 @@ export function VaultApp() {
             }
           }}
           onStatus={setStatus}
+          remember={remember}
+          onRememberChange={setRemember}
           onResetForOnboarding={async () => {
             const nextStatus = await api.resetForOnboarding();
             setAllItems([]);
@@ -1519,7 +1541,7 @@ function EditItemModal({
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <form className="modal-sheet" onSubmit={submit}>
+      <form className={`modal-sheet${item.type === "note" ? " modal-sheet--wide" : ""}`} onSubmit={submit}>
         <div className="modal-head">
           <strong>Edit {TYPE_META[item.type].label.toLowerCase()}</strong>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Close modal">
@@ -1879,10 +1901,12 @@ function SettingsModal({
   onAutoLockMs,
   onClose,
   onImported,
+  onRememberChange,
   onResetForOnboarding,
   onStatus,
   onTheme,
   onToast,
+  remember,
   theme
 }: {
   api: CachetteApi;
@@ -1891,10 +1915,12 @@ function SettingsModal({
   onAutoLockMs: (value: number) => void;
   onClose: () => void;
   onImported: (status: VaultStatus) => Promise<void>;
+  onRememberChange: (status: RememberStatus) => void;
   onResetForOnboarding: () => Promise<void>;
   onStatus: (status: VaultStatus) => void;
   onTheme: (theme: Theme) => void;
   onToast: (message: string) => void;
+  remember: RememberStatus;
   theme: Theme;
 }) {
   const [settings, setSettings] = useState<VaultSettings>({
@@ -2138,6 +2164,36 @@ function SettingsModal({
                 <option value={0}>Never</option>
               </select>
             </label>
+            {remember.available && (
+              <div className="settings-row">
+                <span>
+                  <strong>Stay signed in</strong>
+                  <small>
+                    {remember.enabled
+                      ? "Auto sign-in is on for this device"
+                      : "Enable from the lock screen when unlocking"}
+                  </small>
+                </span>
+                {remember.enabled && (
+                  <button
+                    className="mini-button"
+                    disabled={Boolean(busy)}
+                    onClick={() => {
+                      void api
+                        .disableRemember()
+                        .then((nextRemember) => {
+                          onRememberChange(nextRemember);
+                          onToast("Auto sign-in disabled");
+                        })
+                        .catch((error) => showError(error, onToast));
+                    }}
+                    type="button"
+                  >
+                    Sign out
+                  </button>
+                )}
+              </div>
+            )}
             <div className="settings-row">
               <span>
                 <strong>Master password</strong>
@@ -2475,7 +2531,19 @@ function readStoredList(key: string) {
   }
 }
 
-function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: VaultStatus; onStatus: (status: VaultStatus) => void }) {
+function UnlockScreen({
+  api,
+  status,
+  onStatus,
+  remember,
+  onRememberChange
+}: {
+  api: CachetteApi;
+  status: VaultStatus;
+  onStatus: (status: VaultStatus) => void;
+  remember: RememberStatus;
+  onRememberChange: (status: RememberStatus) => void;
+}) {
   const [mode, setMode] = useState<"password" | "recovery">("password");
   const [password, setPassword] = useState("");
   const [recoveryKey, setRecoveryKey] = useState("");
@@ -2484,15 +2552,39 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
   const [replacementRecoveryKey, setReplacementRecoveryKey] = useState("");
   const [recoveredStatus, setRecoveredStatus] = useState<VaultStatus | null>(null);
   const [error, setError] = useState("");
+  const [keepSignedIn, setKeepSignedIn] = useState(false);
   const copy = useClipboard(api);
 
   async function unlock(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
     try {
-      onStatus(await api.unlockVault(password));
+      const nextStatus = await api.unlockVault(password);
+      if (keepSignedIn && remember.available) {
+        try {
+          onRememberChange(await api.enableRemember());
+        } catch {
+          // Unlock still succeeded; remember-me just stays off.
+        }
+      }
+      onStatus(nextStatus);
     } catch (unlockError) {
       setError(getErrorMessage(unlockError, "Could not unlock vault."));
+    }
+  }
+
+  async function resumeSession() {
+    setError("");
+    try {
+      const nextStatus = await api.autoUnlock();
+      if (!nextStatus.unlocked) {
+        onRememberChange(await api.rememberStatus());
+        setError("Remembered session expired. Enter your master password.");
+        return;
+      }
+      onStatus(nextStatus);
+    } catch (resumeError) {
+      setError(getErrorMessage(resumeError, "Could not resume session."));
     }
   }
 
@@ -2537,9 +2629,26 @@ function UnlockScreen({ api, status, onStatus }: { api: CachetteApi; status: Vau
         />
         {error && <p className="form-error">{error}</p>}
         <button className="primary-button wide" type="submit">Unlock</button>
-        <button className="secondary-button wide" type="button" onClick={() => { setMode("recovery"); setError(""); }}>
-          Use a recovery key
-        </button>
+        {remember.enabled && (
+          <button className="secondary-button wide" type="button" onClick={() => void resumeSession()}>
+            Resume session
+          </button>
+        )}
+        <div className="lock-options-row">
+          <button className="secondary-button" type="button" onClick={() => { setMode("recovery"); setError(""); }}>
+            Use a recovery key
+          </button>
+          {remember.available && (
+            <label className="remember-row">
+              <input
+                type="checkbox"
+                checked={keepSignedIn}
+                onChange={(event) => setKeepSignedIn(event.target.checked)}
+              />
+              <span>Keep me signed in</span>
+            </label>
+          )}
+        </div>
       </form>
       )}
 
@@ -2705,6 +2814,10 @@ function createBrowserFallbackApi(): CachetteApi {
       unlocked = false;
       return { initialized, unlocked, itemCount: items.length };
     },
+    autoUnlock: async () => ({ initialized, unlocked, itemCount: items.length }),
+    rememberStatus: async () => ({ available: false, enabled: false }),
+    enableRemember: async () => ({ available: false, enabled: false }),
+    disableRemember: async () => ({ available: false, enabled: false }),
     listItems: async (filters) => {
       const search = filters?.search?.toLowerCase();
       return items.filter((item) => {

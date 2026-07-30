@@ -144,7 +144,7 @@ export function AddItemModal({ api, categories, onClose, onSave }: AddItemModalP
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <form className="modal-sheet" onSubmit={submit}>
+      <form className={`modal-sheet${type === "note" ? " modal-sheet--wide" : ""}`} onSubmit={submit}>
         <div className="modal-head">
           <strong>{selectedType ? `New ${selectedType.label.toLowerCase()}` : "Add to vault"}</strong>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Close modal">

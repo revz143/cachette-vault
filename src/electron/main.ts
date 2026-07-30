@@ -1,9 +1,10 @@
-import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Menu, safeStorage, shell, Tray } from "electron";
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
 import { VaultDatabase } from "./db";
-import type { VaultSettings } from "../shared/types";
+import type { RememberStatus, VaultSettings, VaultStatus } from "../shared/types";
 
 const SERVICE_NAME = "Cachette Vault";
 const APP_ICON_PATH = path.join(app.getAppPath(), "assets", "icon.ico");
@@ -19,6 +20,7 @@ let registeredTrayShortcut = "";
 
 type AppSettings = {
   trayShortcut: string;
+  rememberSecret?: string;
 };
 
 const itemTypeSchema = z.enum(["note", "link", "repo", "image", "password", "private", "todo"]);
@@ -173,6 +175,7 @@ function createTrayMenu(): Menu {
     {
       label: "Lock vault",
       click: () => {
+        clearRemember();
         vault?.lock();
       }
     },
@@ -244,15 +247,46 @@ function registerIpc(): void {
 
   handle("vault:unlock", (_event, masterPassword) => vault.unlock(requirePassword(masterPassword)));
 
-  handle("vault:recover", (_event, recoveryKey, nextMasterPassword) => {
+  handle("vault:recover", async (_event, recoveryKey, nextMasterPassword) => {
     const parsedRecoveryKey = z.string().parse(recoveryKey);
     if (parsedRecoveryKey.trim().length < 10) {
       throw new Error("Recovery key is required.");
     }
-    return vault.recoverWithRecoveryKey(parsedRecoveryKey, requirePassword(nextMasterPassword));
+    const result = await vault.recoverWithRecoveryKey(parsedRecoveryKey, requirePassword(nextMasterPassword));
+    clearRemember();
+    return result;
   });
 
-  handle("vault:lock", () => vault.lock());
+  handle("vault:lock", (_event, options) => {
+    const parsed = z.object({ forget: z.boolean().optional() }).optional().parse(options);
+    if (parsed?.forget) {
+      clearRemember();
+    }
+    return vault.lock();
+  });
+
+  handle("vault:auto-unlock", () => attemptAutoUnlock());
+
+  handle("remember:status", () => rememberStatus());
+
+  handle("remember:enable", () => {
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("Secure storage is not available on this device.");
+    }
+    const secret = randomBytes(32);
+    try {
+      vault.createRememberSlot(secret);
+      storeRememberSecret(secret);
+    } finally {
+      secret.fill(0);
+    }
+    return rememberStatus();
+  });
+
+  handle("remember:disable", () => {
+    clearRemember();
+    return rememberStatus();
+  });
 
   handle("items:list", (_event, filters) => vault.listItems(filtersSchema.parse(filters)));
 
@@ -304,7 +338,11 @@ function registerIpc(): void {
     return backupPath ? { path: backupPath, name: path.basename(backupPath) } : null;
   });
 
-  handle("backup:import", (_event, request) => vault.importBackup(backupImportSchema.parse(request)));
+  handle("backup:import", async (_event, request) => {
+    const result = await vault.importBackup(backupImportSchema.parse(request));
+    clearRemember();
+    return result;
+  });
 
   handle("settings:status", () => settingsStatus());
 
@@ -330,15 +368,19 @@ function registerIpc(): void {
     return settingsStatus();
   });
 
-  handle("settings:change-password", (_event, currentPassword, nextPassword) => {
-    return vault.changeMasterPassword(requirePassword(currentPassword), requirePassword(nextPassword));
+  handle("settings:change-password", async (_event, currentPassword, nextPassword) => {
+    const status = await vault.changeMasterPassword(requirePassword(currentPassword), requirePassword(nextPassword));
+    clearRemember();
+    return status;
   });
 
   handle("dev:reset-onboarding", () => {
     if (!isDevelopmentMode()) {
       throw new Error("Onboarding reset is only available in development mode.");
     }
-    return vault.resetForDevelopment();
+    const status = vault.resetForDevelopment();
+    clearRemember();
+    return status;
   });
 
   handle("shell:open-path", async (_event, targetPath) => {
@@ -453,7 +495,8 @@ function readAppSettings(): AppSettings {
   try {
     const parsed = JSON.parse(fs.readFileSync(appSettingsPath(), "utf8")) as Partial<AppSettings>;
     return {
-      trayShortcut: typeof parsed.trayShortcut === "string" ? parsed.trayShortcut : DEFAULT_TRAY_SHORTCUT
+      trayShortcut: typeof parsed.trayShortcut === "string" ? parsed.trayShortcut : DEFAULT_TRAY_SHORTCUT,
+      rememberSecret: typeof parsed.rememberSecret === "string" ? parsed.rememberSecret : undefined
     };
   } catch {
     return { trayShortcut: DEFAULT_TRAY_SHORTCUT };
@@ -462,6 +505,68 @@ function readAppSettings(): AppSettings {
 
 function writeAppSettings(settings: AppSettings): void {
   fs.writeFileSync(appSettingsPath(), JSON.stringify(settings, null, 2), { mode: 0o600 });
+}
+
+function storeRememberSecret(secret: Buffer): void {
+  const encrypted = safeStorage.encryptString(secret.toString("base64"));
+  writeAppSettings({ ...readAppSettings(), rememberSecret: encrypted.toString("base64") });
+}
+
+function readRememberSecret(): Buffer | null {
+  const { rememberSecret } = readAppSettings();
+  if (!rememberSecret || !safeStorage.isEncryptionAvailable()) {
+    return null;
+  }
+  try {
+    return Buffer.from(safeStorage.decryptString(Buffer.from(rememberSecret, "base64")), "base64");
+  } catch {
+    return null;
+  }
+}
+
+function clearRemember(): void {
+  vault?.clearRememberSlot();
+  const settings = readAppSettings();
+  if (settings.rememberSecret) {
+    delete settings.rememberSecret;
+    writeAppSettings(settings);
+  }
+}
+
+function rememberStatus(): RememberStatus {
+  const available = safeStorage.isEncryptionAvailable();
+  const slot = vault.readRememberSlot();
+  if (!slot) {
+    return { available, enabled: false };
+  }
+  if (!readAppSettings().rememberSecret) {
+    clearRemember();
+    return { available, enabled: false };
+  }
+  return { available, enabled: true };
+}
+
+function attemptAutoUnlock(): VaultStatus {
+  if (vault.status().unlocked) {
+    return vault.status();
+  }
+  const slot = vault.readRememberSlot();
+  if (!slot) {
+    return vault.status();
+  }
+  const secret = readRememberSecret();
+  if (!secret) {
+    clearRemember();
+    return vault.status();
+  }
+  try {
+    return vault.unlockWithRememberedKey(secret);
+  } catch {
+    clearRemember();
+    return vault.status();
+  } finally {
+    secret.fill(0);
+  }
 }
 
 function isDevelopmentMode(): boolean {

@@ -22,6 +22,11 @@ export type VaultSettings = {
   developmentMode: boolean;
 };
 
+export type RememberStatus = {
+  available: boolean;
+  enabled: boolean;
+};
+
 export type VaultSetupResult = {
   status: VaultStatus;
   recoveryKeys: string[];
@@ -118,7 +123,11 @@ export type CachetteApi = {
   setupVault: (masterPassword: string) => Promise<VaultSetupResult>;
   unlockVault: (masterPassword: string) => Promise<VaultStatus>;
   recoverVault: (recoveryKey: string, nextMasterPassword: string) => Promise<VaultRecoveryResult>;
-  lockVault: () => Promise<VaultStatus>;
+  lockVault: (options?: { forget?: boolean }) => Promise<VaultStatus>;
+  autoUnlock: () => Promise<VaultStatus>;
+  rememberStatus: () => Promise<RememberStatus>;
+  enableRemember: () => Promise<RememberStatus>;
+  disableRemember: () => Promise<RememberStatus>;
   listItems: (filters?: ItemFilters) => Promise<VaultItem[]>;
   createItem: (draft: ItemDraft) => Promise<VaultItem>;
   updateItem: (update: ItemUpdate) => Promise<VaultItem>;

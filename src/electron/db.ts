@@ -84,7 +84,13 @@ type VaultWrapping = {
 
 const WRAPPING_METADATA_KEY = "vault:wrapping";
 const LEGACY_KDF_METADATA_KEY = "vault:kdf";
+const REMEMBER_METADATA_KEY = "vault:remember";
 const RECOVERY_KEY_COUNT = 3;
+
+export type RememberSlot = {
+  wrappedKey: string;
+  createdAt: string;
+};
 
 const INSERT_ITEM_SQL = `INSERT INTO items (id, type, title, content, content_format, url, repo_path, category, tags, encrypted_data, created_at, updated_at)
  VALUES (@id, @type, @title, @content, @content_format, @url, @repo_path, @category, @tags, @encrypted_data, @created_at, @updated_at)`;
@@ -248,6 +254,34 @@ export class VaultDatabase {
   lock(): VaultStatus {
     zeroKey(this.key);
     this.key = null;
+    return this.status();
+  }
+
+  readRememberSlot(): RememberSlot | undefined {
+    const raw = this.getMetadata(REMEMBER_METADATA_KEY);
+    return raw ? (JSON.parse(raw) as RememberSlot) : undefined;
+  }
+
+  createRememberSlot(secret: Buffer): RememberSlot {
+    const key = this.requireKey();
+    const slot: RememberSlot = {
+      wrappedKey: this.wrapVaultKey(key, secret),
+      createdAt: new Date().toISOString()
+    };
+    this.setMetadata(REMEMBER_METADATA_KEY, JSON.stringify(slot));
+    return slot;
+  }
+
+  clearRememberSlot(): void {
+    this.db.prepare("DELETE FROM metadata WHERE key = ?").run(REMEMBER_METADATA_KEY);
+  }
+
+  unlockWithRememberedKey(secret: Buffer): VaultStatus {
+    const slot = this.readRememberSlot();
+    if (!slot) {
+      throw new Error("No remembered session.");
+    }
+    this.key = this.unwrapVaultKey(slot.wrappedKey, secret);
     return this.status();
   }
 
@@ -523,7 +557,10 @@ export class VaultDatabase {
 
   async exportBackup(backupPassword: string): Promise<BackupExportResult> {
     this.requireKey();
-    const metadata = this.db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>;
+    // Remember-me slots are device-bound; never carry them across machines in backups.
+    const metadata = (
+      this.db.prepare("SELECT key, value FROM metadata").all() as Array<{ key: string; value: string }>
+    ).filter((row) => row.key !== REMEMBER_METADATA_KEY);
     const items = this.db.prepare("SELECT * FROM items ORDER BY created_at ASC").all() as ItemRow[];
     const attachments = this.db.prepare("SELECT * FROM attachments ORDER BY created_at ASC").all() as AttachmentRow[];
     const files = attachments
@@ -749,7 +786,10 @@ export class VaultDatabase {
       const insertItem = this.db.prepare(INSERT_ITEM_SQL);
       const insertAttachment = this.db.prepare(INSERT_ATTACHMENT_SQL);
 
-      for (const row of payload.metadata) insertMeta.run(row);
+      for (const row of payload.metadata) {
+        if (row.key === REMEMBER_METADATA_KEY) continue;
+        insertMeta.run(row);
+      }
       for (const row of payload.items) insertItem.run(this.normalizeBackupItemRow(row));
       for (const row of nextAttachments) insertAttachment.run(row);
     });
